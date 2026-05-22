@@ -1,0 +1,28 @@
+# Watchlist y configuración de instrumentos GGAL
+underlying: GGAL
+
+# Mapa de códigos de vencimiento → fecha real (tercer viernes del mes).
+# Actualizar al inicio de cada ciclo. Los vencimientos de GGAL son mensuales.
+# Convención BYMA: calls y puts del mismo vencimiento comparten código.
+# Verificar los códigos vigentes en Bull Market / OptionsDesk antes de operar.
+expiry_calendar:
+  # Ejemplos para 2026 — reemplazar con los reales
+  D: "2026-04-17"
+  E: "2026-05-15"
+  F: "2026-06-19"
+  G: "2026-07-17"
+  H: "2026-08-21"
+  I: "2026-09-18"
+  J: "2026-10-16"
+
+# Filtros de liquidez mínima
+min_bid: 1.0           # prima mínima en el bid (ARS)
+max_spread_pct: 30.0   # spread bid-ask máximo como % del mid
+max_price_age_s: 300   # precio desactualizado después de N segundos
+
+# Pricing
+risk_free_rate: 0.00   # 0 = usa la caución como tasa base
+pricing_steps: 100     # pasos del árbol CRR (100 es rápido; 200 para más precisión)
+
+# Moneyness: ATM si |spot - strike| / spot < threshold
+atm_threshold_pct: 2.0

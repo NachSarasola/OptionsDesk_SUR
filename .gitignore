@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+env/
+*.parquet
+data/snapshots/
+data/paper_orders.jsonl
+.mypy_cache/

@@ -1,0 +1,12 @@
+pyhomebroker>=0.2
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+streamlit>=1.28
+pyarrow>=14.0
+python-dotenv>=1.0
+requests>=2.31
+pyyaml>=6.0
+pyobd>=0.3
+pandas-ta>=0.3.14b
+smartmoneyconcepts>=0.0.27
