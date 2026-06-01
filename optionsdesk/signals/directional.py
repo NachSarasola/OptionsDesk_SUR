@@ -11,10 +11,15 @@ recorder), usa el cálculo SMA simple original.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
+
+from optionsdesk.signals.technical import analyze as _analyze_technical, atr as _atr_technical
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -86,9 +91,7 @@ def compute_market_context(
 # ── Implementaciones ──────────────────────────────────────────────────────────
 
 def _from_ohlcv(df: pd.DataFrame) -> MarketContext:
-    from optionsdesk.signals.technical import analyze   # import local para no circularizar
-
-    snap = analyze(df)
+    snap = _analyze_technical(df)
     n    = len(df)
 
     # Mapeo de tendencia: TechnicalSnapshot usa mayúsculas
@@ -172,14 +175,13 @@ def _build_note(trend: str, momentum_pct: float, confidence: str, n_days: int) -
 
 def _enrich_htf(ctx: MarketContext, htf: pd.DataFrame) -> MarketContext:
     """Corre analyze() sobre el OHLCV semanal y rellena htf_trend/htf_snap."""
-    from optionsdesk.signals.technical import analyze   # local para no circularizar
     try:
-        snap = analyze(htf)
+        snap = _analyze_technical(htf)
         trend_map = {"ALCISTA": "alcista", "BAJISTA": "bajista", "LATERAL": "lateral"}
         ctx.htf_trend = trend_map.get(snap.trend, "lateral")
         ctx.htf_snap  = snap
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_enrich_htf fallo: %s", e)
     return ctx
 
 
@@ -189,17 +191,16 @@ def _enrich_ltf(ctx: MarketContext, ltf: pd.DataFrame) -> MarketContext:
     Para LTF intradiario: usa las ultimas 60 barras (1h de datos a 1-min)
     y omite SMC (muy ruidoso en 1-min). Solo indicadores clasicos.
     """
-    from optionsdesk.signals.technical import analyze
     try:
         df = ltf.tail(60).reset_index(drop=True)
         if len(df) < 5:
             return ctx
-        snap = analyze(df)
+        snap = _analyze_technical(df)
         trend_map = {"ALCISTA": "alcista", "BAJISTA": "bajista", "LATERAL": "lateral"}
         ctx.ltf_trend = trend_map.get(snap.trend, "lateral")
         ctx.ltf_snap  = snap
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_enrich_ltf fallo: %s", e)
     return ctx
 
 
@@ -231,15 +232,19 @@ def _mtf_alignment(daily: str, htf: str, ltf: str) -> str:
 
 def _vol_regime(df_daily: pd.DataFrame, short_n: int = 5, long_n: int = 20) -> str:
     """Compara ATR reciente vs historico para detectar expansion/contraccion."""
-    from optionsdesk.signals.technical import atr as _atr
     try:
         if len(df_daily) < long_n + 2:
             return "normal"
-        atr_series = _atr(df_daily, long_n).dropna()
+        atr_series = _atr_technical(df_daily, long_n).dropna()
         if len(atr_series) < short_n + 1:
             return "normal"
         recent  = float(atr_series.iloc[-short_n:].mean())
-        hist    = float(atr_series.mean())
+        # Excluir los ultimos short_n del baseline para no contaminar con el periodo reciente
+        hist    = float(
+            atr_series.iloc[:-short_n].mean()
+            if len(atr_series) > short_n
+            else atr_series.mean()
+        )
         if hist <= 0:
             return "normal"
         ratio = recent / hist
@@ -248,5 +253,6 @@ def _vol_regime(df_daily: pd.DataFrame, short_n: int = 5, long_n: int = 20) -> s
         if ratio < 0.75:
             return "contraccion"
         return "normal"
-    except Exception:
+    except Exception as e:
+        logger.warning("_vol_regime fallo: %s", e)
         return "normal"

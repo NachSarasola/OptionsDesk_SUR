@@ -162,3 +162,31 @@ def test_max_loss_equals_total_cost(mock_days):
     idea  = build_directional_idea(ctx, chain, 8500.0)
     if idea is not None:
         assert idea.max_loss_ars == pytest.approx(idea.total_cost_ars)
+
+
+# ── v2.6: _naked_pop fallback cap ─────────────────────────────────────────────
+
+def test_naked_pop_fallback_capped_sigma():
+    """Con ATR extremo (10%) y sin realized_vol, sigma se acota a 1.50 max."""
+    from optionsdesk.signals.directional_ideas import _naked_pop
+
+    # ATR=10% → sigma_proxy = 0.10 * sqrt(252) ≈ 1.587 > cap(1.50)
+    ctx = _make_context(trend="alcista", atr_pct=10.0, momentum_pct=3.0)
+
+    # PoP con sigma=1.50 (capada)
+    pop_capped = _naked_pop(
+        spot=8300.0, breakeven=8900.0, days=30,
+        is_call=True, context=ctx, realized_vol=None,
+    )
+    # PoP directa con sigma=1.587 (sin cap)
+    from optionsdesk.core.pricing import risk_neutral_prob_above
+    import math
+    sigma_uncapped = 0.10 * math.sqrt(252)
+    pop_uncapped = risk_neutral_prob_above(8300.0, 8900.0, 30/365, 0.0, sigma_uncapped)
+
+    # Con cap la PoP debe ser diferente (la sigma fue truncada)
+    assert pop_capped != pytest.approx(pop_uncapped, rel=1e-4), (
+        "el cap no tuvo efecto — la sigma no se recortó"
+    )
+    # Además debe ser un número razonable, no 0 ni 1
+    assert 0.01 < pop_capped < 0.99

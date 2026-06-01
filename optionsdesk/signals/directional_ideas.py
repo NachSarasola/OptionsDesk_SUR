@@ -13,8 +13,11 @@ build_directional_idea(context, chain, spot, snap) → DirectionalIdea | None
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from optionsdesk.core.instruments import days_to_expiry
 from optionsdesk.core.spreads import SpreadResult
@@ -55,6 +58,7 @@ class DirectionalIdea:
     stop_spot: float        # stop sugerido basado en ATR
     rational: str           # por qué se sugiere esta idea
     disclaimer: str = _DISCLAIMER
+    prob_of_profit: float = 0.0   # v2.4: PoP física (drift=0, vol realizada)
 
 
 def build_directional_idea(
@@ -62,6 +66,7 @@ def build_directional_idea(
     chain: OptionsChain,
     spot: float,
     snap: Optional[TechnicalSnapshot] = None,
+    realized_vol: Optional[float] = None,   # v2.4: para PoP física
 ) -> Optional[DirectionalIdea]:
     """Construye una idea direccional si la señal AT + SMC es suficientemente fuerte.
 
@@ -125,6 +130,9 @@ def build_directional_idea(
     rational = _build_rational(context, snap, best["strike"], best["days"], atr, spot,
                                 target_note, stop_note)
 
+    # PoP física: drift=0, vol realizada (o fallback al ATR como proxy de vol)
+    pop = _naked_pop(spot, breakeven, best["days"], is_call, context, realized_vol)
+
     return DirectionalIdea(
         idea_type=idea_type,
         symbol=best["symbol"],
@@ -137,6 +145,7 @@ def build_directional_idea(
         target_spot=round(target_spot, 2),
         stop_spot=round(stop_spot, 2),
         rational=rational,
+        prob_of_profit=round(pop, 3),
     )
 
 
@@ -147,6 +156,7 @@ def build_directional_spread(
     snap: Optional[TechnicalSnapshot] = None,
     expiry_calendar: Optional[dict] = None,
     benchmark=None,
+    realized_vol: Optional[float] = None,   # v2.4: vol realizada para EV/PoP
 ) -> Optional[SpreadResult]:
     """Construye el mejor spread vertical en la direccion del contexto multi-TF.
 
@@ -190,13 +200,17 @@ def build_directional_spread(
 
     from optionsdesk.strategies.vertical_spread import VerticalSpreadScanner
     scanner = VerticalSpreadScanner(expiry_calendar=expiry_calendar or {})
-    spreads = scanner.scan(chain, bm, direction=direction)
+    spreads = scanner.scan(chain, bm, direction=direction, realized_vol=realized_vol)
 
     if not spreads:
         return None
 
-    # El scanner ya ordena por risk_reward x PoP; tomamos el mejor
-    return spreads[0]
+    best = spreads[0]
+    # Gate de EV: no recomendar spread con expectativa negativa
+    if best.expected_value <= 0:
+        return None
+
+    return best
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
@@ -231,8 +245,9 @@ def _find_candidates(
             continue
 
         try:
-            days = days_to_expiry(sym)  # noqa: F841 — ya importado a nivel módulo
-        except Exception:
+            days = days_to_expiry(sym)
+        except Exception as e:
+            logger.debug("days_to_expiry fallo para %s: %s", sym, e)
             continue
 
         if not (_MIN_DAYS <= days <= _MAX_DAYS):
@@ -248,13 +263,16 @@ def _find_candidates(
 
 
 def _parse_strike(symbol: str) -> Optional[float]:
-    """Extrae el strike del símbolo BYMA (ej. GFGC8500OC → 8500.0)."""
-    import re
-    # Formato típico: prefijo + strike + sufijo (OC/OV/etc.)
-    m = re.search(r"(\d{3,6}(?:\.\d+)?)", symbol)
+    """Extrae el strike usando el mismo regex que instruments.py (_TICKER_RE).
+
+    Reemplaza el regex propio anterior que podia capturar digitos del prefijo.
+    Para simbolos malformados devuelve None (el candidato se omite correctamente).
+    """
+    from optionsdesk.core.instruments import _TICKER_RE
+    m = _TICKER_RE.match(symbol.strip().upper())
     if m:
         try:
-            return float(m.group(1))
+            return float(m.group("strike").replace(",", "."))
         except ValueError:
             return None
     return None
@@ -297,6 +315,30 @@ def _resolve_stop(
             return stop, f"sobre OB bajista (${ob.low:,.0f}–${ob.high:,.0f})"
     default = spot - 1.0 * atr if is_call else spot + 1.0 * atr
     return default, "1×ATR"
+
+
+def _naked_pop(
+    spot: float,
+    breakeven: float,
+    days: int,
+    is_call: bool,
+    context: "MarketContext",
+    realized_vol: Optional[float],
+) -> float:
+    """PoP física de una opción desnuda (drift=0, vol realizada o proxy ATR)."""
+    from optionsdesk.core.pricing import risk_neutral_prob_above
+    T = max(days / 365.0, 1e-6)
+    if realized_vol and realized_vol > 0:
+        sigma = realized_vol
+    else:
+        # Fallback: proxy ATR→sigma. ATR es rango suavizado, NO desvío log
+        # diario — multiplicar por sqrt(252) sobreestima la dispersión ~13%.
+        # Acotado a [20%, 150%] para evitar artefactos: ATR=10% (crash mode)
+        # daría 160% sin cap, produciendo PoP ≈ 0.5 para cualquier breakeven.
+        sigma_proxy = context.atr_pct / 100.0 * (252 ** 0.5)
+        sigma = min(max(sigma_proxy, 0.20), 1.50)
+    p_above = risk_neutral_prob_above(spot, breakeven, T, 0.0, sigma)
+    return p_above if is_call else (1.0 - p_above)
 
 
 def _build_rational(

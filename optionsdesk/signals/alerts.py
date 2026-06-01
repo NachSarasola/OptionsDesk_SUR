@@ -94,6 +94,46 @@ class TelegramAlerter:
         )
         return self._send(text)
 
+    def send_management_signal(
+        self,
+        signal: "ManagementSignal",  # noqa: F821
+        pos: "OpenPosition",         # noqa: F821
+    ) -> bool:
+        """Alerta de gestión activa: take-profit, stop, roll o defensa."""
+        from optionsdesk.signals.management import SignalType
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        icons = {
+            SignalType.TAKE_PROFIT: "✅",
+            SignalType.STOP:        "🛑",
+            SignalType.ROLL:        "🔄",
+            SignalType.DEFEND:      "⚠️",
+        }
+        icon = icons.get(signal.signal_type, "ℹ️")
+        delta_str = (
+            f"  |  Delta: {signal.current_delta:.2f}" if signal.current_delta is not None else ""
+        )
+        text = (
+            f"{icon} <b>{signal.signal_type} — {pos.symbol}</b> [{ts}]\n"
+            f"{signal.reason}\n"
+            f"Captura actual: <b>{signal.capture_pct:.1f}%</b>{delta_str}\n"
+            f"<i>Acción sugerida:</i> {signal.suggested_action}"
+        )
+        return self._send(text)
+
+    def send_intraday_opportunity(self, signal: "IntradaySignal") -> bool:  # noqa: F821
+        """Alerta de oportunidad intradía (scalping de prima)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        icon = "📈" if signal.signal_type == "WRITE" else "💰"
+        text = (
+            f"{icon} <b>Intradía {signal.signal_type} — {signal.symbol}</b> [{ts}]\n"
+            f"{signal.message}\n"
+            f"Prima: {signal.current_premium:,.2f}  |  "
+            f"Cambio: {signal.premium_change_pct:+.1f}%  |  "
+            f"z-score IV: {signal.iv_residual_z:+.1f}"
+        )
+        return self._send(text)
+
     def send_recommendation(self, rec: "Recommendation") -> bool:  # noqa: F821
         """Envía la recomendacion de un perfil por Telegram."""
         from optionsdesk.signals.recommender import Recommendation  # local para evitar ciclo

@@ -187,7 +187,8 @@ class UnderlyingHistory:
             return None
         try:
             return pd.read_parquet(path)
-        except Exception:
+        except Exception as e:
+            logger.debug("read_parquet fallo para %s: %s", path, e)
             return None
 
     @staticmethod

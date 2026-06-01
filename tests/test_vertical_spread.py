@@ -10,7 +10,7 @@ from optionsdesk.core.benchmark import Benchmark
 from optionsdesk.data.providers.base import OptionsChain, Quote
 from optionsdesk.strategies.vertical_spread import VerticalSpreadConfig, VerticalSpreadScanner
 
-TODAY = date.today()
+TODAY = date(2026, 6, 20)   # fijo — inmune a vencimientos reales
 
 _CAUCION = Benchmark(caucion_tna_pct=70.0, days=1)
 
@@ -40,8 +40,12 @@ def _make_chain(spot: float, options: dict[str, tuple]) -> OptionsChain:
 
 
 def _make_calendar():
-    """Calendario minimo con codigo F = 30 dias."""
-    return {"F": TODAY + timedelta(days=30)}
+    """Calendario minimo con codigo F = 30 dias desde hoy.
+
+    Usa date.today() (no TODAY fijo) para que days_to_expiry en OptionContract
+    devuelva ~30 independientemente de la fecha del sistema.
+    """
+    return {"F": date.today() + timedelta(days=30)}
 
 
 SPOT = 8300.0
@@ -117,8 +121,8 @@ def test_wide_spread_leg_excluded():
     assert results == []
 
 
-def test_sorted_by_rr_times_pop():
-    """Los resultados deben estar ordenados de mayor a menor risk_reward * PoP."""
+def test_sorted_by_ev_return_pct():
+    """Los resultados deben estar ordenados por ev_return_pct descendente."""
     chain = _make_chain(SPOT, {
         "GFGC7500F": (550.0, 590.0),
         "GFGC8000F": (280.0, 320.0),
@@ -126,14 +130,44 @@ def test_sorted_by_rr_times_pop():
     })
     scanner = VerticalSpreadScanner(expiry_calendar=_CAL)
     results = scanner.scan(chain, _CAUCION)
-    scores = [r.risk_reward * r.prob_of_profit for r in results]
-    assert scores == sorted(scores, reverse=True)
+    evs = [r.ev_return_pct for r in results]
+    assert evs == sorted(evs, reverse=True)
+
+
+def test_scanner_realized_vol_param():
+    """realized_vol se acepta sin error y los campos EV se computan."""
+    chain = _make_chain(SPOT, {
+        "GFGC8000F": (280.0, 320.0),
+        "GFGC8500F": (130.0, 170.0),
+    })
+    scanner = VerticalSpreadScanner(expiry_calendar=_CAL)
+    results = scanner.scan(chain, _CAUCION, direction="bullish", realized_vol=0.50)
+    assert len(results) > 0
+    sr = results[0]
+    assert isinstance(sr.expected_value, float)
+    assert isinstance(sr.ev_return_pct, float)
 
 
 def test_empty_chain_returns_empty():
     chain = _make_chain(SPOT, {})
     scanner = VerticalSpreadScanner(expiry_calendar=_CAL)
     assert scanner.scan(chain, _CAUCION) == []
+
+
+def test_spread_result_has_ev_fields():
+    """SpreadResult debe tener expected_value y ev_return_pct."""
+    chain = _make_chain(SPOT, {
+        "GFGC8000F": (280.0, 320.0),
+        "GFGC8500F": (130.0, 170.0),
+    })
+    scanner = VerticalSpreadScanner(expiry_calendar=_CAL)
+    results = scanner.scan(chain, _CAUCION, direction="bullish")
+    assert len(results) > 0
+    sr = results[0]
+    assert hasattr(sr, "expected_value")
+    assert hasattr(sr, "ev_return_pct")
+    # EV acotado al rango del payoff
+    assert -sr.max_loss <= sr.expected_value <= sr.max_profit
 
 
 def test_spread_result_fields_populated():
@@ -152,3 +186,43 @@ def test_spread_result_fields_populated():
         assert sr.days > 0
         assert sr.long_leg.action == "BUY"
         assert sr.short_leg.action == "SELL"
+
+
+# ── v2.5: pares no-adyacentes ─────────────────────────────────────────────────
+
+def test_scanner_finds_non_adjacent_pair():
+    """K=8000 y K=8500 líquidas; K=8250 ilíquida (bid=0) → 8000/8500 debe aparecer."""
+    chain = _make_chain(SPOT, {
+        "GFGC8000F": (280.0, 320.0),  # líquida
+        "GFGC8250F": (0.0, 200.0),    # ilíquida: bid=0 → excluida por _is_liquid
+        "GFGC8500F": (130.0, 170.0),  # líquida
+    })
+    scanner = VerticalSpreadScanner(expiry_calendar=_CAL)
+    results = scanner.scan(chain, _CAUCION, direction="bullish")
+
+    strikes_found = {
+        (r.long_leg.strike, r.short_leg.strike)
+        for r in results
+        if r.strategy == "BULL_CALL"
+    }
+    assert (8000.0, 8500.0) in strikes_found
+
+
+def test_max_width_filters_far_pairs():
+    """Con max_width_pct muy pequeño, pares con ancho excesivo no aparecen."""
+    cfg = VerticalSpreadConfig(max_width_pct=0.03)  # 3% de 8300 ≈ 249
+    chain = _make_chain(SPOT, {
+        "GFGC8000F": (280.0, 320.0),
+        "GFGC8200F": (190.0, 230.0),
+        "GFGC8500F": (130.0, 170.0),
+    })
+    scanner = VerticalSpreadScanner(config=cfg, expiry_calendar=_CAL)
+    results = scanner.scan(chain, _CAUCION, direction="bullish")
+
+    # 8000/8500 (Δ=500 > 249) no debe aparecer
+    wide_pairs = [
+        r for r in results
+        if r.strategy == "BULL_CALL"
+        and abs(r.short_leg.strike - r.long_leg.strike) > 249
+    ]
+    assert wide_pairs == []

@@ -42,6 +42,13 @@ class RateResult:
     moneyness: str
     is_liquid: bool
     _spread_vs_caucion_pct: float = field(default=0.0, repr=False)
+    # Campos de edge cuantitativo — enriquecidos por core/edge.py (v2.3+)
+    vol_edge: Optional[object] = field(default=None, repr=False)   # VolEdge
+    prob_profit: Optional[float] = field(default=None, repr=False)  # PoP física
+    expected_value_pct: Optional[float] = field(default=None, repr=False)  # EV anual %
+    expected_value_ars: Optional[float] = field(default=None, repr=False)  # EV por lote
+    # v3.1: mispricing vs sonrisa IV (positivo = cotiza caro → bueno para vender)
+    mispricing_pp: Optional[float] = field(default=None, repr=False)
 
     @property
     def spread_vs_caucion_pct(self) -> float:
@@ -105,7 +112,7 @@ def compute_covered_call(
     if contract.option_type != OptionType.CALL:
         return None
     days = contract.days_to_expiry
-    if days <= 0:
+    if days < 1:
         return None
 
     # Compramos la acción al ask
@@ -124,7 +131,15 @@ def compute_covered_call(
     cost_exercise = cost_model.exercise_cost(contract.strike)
 
     net_outlay = spot + cost_buy_stock + cost_sell_call - call_prem
-    net_proceeds = contract.strike + dividends - cost_exercise
+    
+    if contract.strike < spot:
+        # ITM: Asumimos ejercicio. Cobramos el strike.
+        net_proceeds = contract.strike + dividends - cost_exercise
+    else:
+        # OTM: Tasa estática. No inventamos ganancia de capital. 
+        # El retorno es la prima menos los costos de una eventual venta de la acción.
+        cost_sell_stock = cost_model.gross_cost(spot, "stock_sell")
+        net_proceeds = spot + dividends - cost_sell_stock
 
     if net_outlay <= 0:
         return None
@@ -137,7 +152,7 @@ def compute_covered_call(
     # Colchón: cuánto puede caer el spot sin que perdamos la tasa
     # (breakeven = net_outlay - dividends es el precio mínimo de la acción al ejercicio)
     breakeven_spot = net_outlay - dividends
-    cushion_pct = (spot - breakeven_spot) / spot * 100.0
+    cushion_pct = (spot - breakeven_spot) / spot * 100.0 if spot > 0 else 0.0
 
     moneyness = contract.moneyness(spot, atm_threshold_pct)
 
@@ -187,7 +202,7 @@ def compute_short_put(
     if contract.option_type != OptionType.PUT:
         return None
     days = contract.days_to_expiry
-    if days <= 0:
+    if days < 1:
         return None
 
     put_prem = _effective_price(put_bid, put_ask, put_last, price_mode, "sell")

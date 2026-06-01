@@ -9,9 +9,10 @@ Modo avanzado: desbloquea Cadena completa, Simulador P&L e Historial.
 from __future__ import annotations
 
 import re
-import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -383,13 +384,30 @@ def _inject_css() -> None:
 def _build_provider(demo: bool) -> MarketDataProvider:
     if demo:
         return DemoProvider()
+
+    if settings.is_iol_configured():
+        try:
+            from optionsdesk.data.providers.iol import IOLProvider
+            p = IOLProvider()
+            p.connect()
+            return p
+        except Exception as exc:
+            st.warning(f"IOL no disponible ({exc}). Intentando fuente alternativa.")
+
+    if settings.is_configured():
+        try:
+            from optionsdesk.data.providers.homebroker import HomeBrokerProvider
+            p = HomeBrokerProvider()
+            p.connect()
+            return p
+        except Exception as exc:
+            st.warning(f"HomeBroker no disponible ({exc}). Intentando BYMA Open Data.")
+
     try:
-        from optionsdesk.data.providers.homebroker import HomeBrokerProvider
-        p = HomeBrokerProvider()
-        p.connect()
-        return p
+        from optionsdesk.data.providers.byma_open import BymaOpenProvider
+        return BymaOpenProvider()
     except Exception as exc:
-        st.warning(f"HomeBroker no disponible ({exc}). Usando modo demo.")
+        st.warning(f"BYMA Open Data no disponible ({exc}). Usando modo demo.")
         return DemoProvider()
 
 
@@ -431,7 +449,7 @@ def _load_htf_history(weeks: int = 52) -> Optional[pd.DataFrame]:
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=20)
 def _load_ltf_history() -> Optional[pd.DataFrame]:
     """Historial intradiario de GGAL (LTF). TTL corto para reflejar precio en tiempo real."""
     try:
@@ -573,6 +591,127 @@ def _spread_payoff_df(sr) -> pd.DataFrame:
         ),
     )
     return pd.DataFrame({"P&L ($)": pnl, "Cero": np.zeros(len(spots))}, index=spots)
+
+
+# ── Gráfico de velas (estilo TradingView) ─────────────────────────────────────
+
+def _candlestick_chart(
+    df: pd.DataFrame,
+    *,
+    title: str = "",
+    height: int = 420,
+    smas: Optional[dict[str, int]] = None,
+    levels: Optional[list[dict]] = None,
+    show_volume: bool = True,
+    max_bars: int = 120,
+) -> None:
+    """Render de velas japonesas tema oscuro con volumen, medias y niveles.
+
+    df: DataFrame OHLCV con columnas open/high/low/close (+ volume opcional) y
+        un índice temporal en 'date' o 'time'. Cae a st.line_chart si plotly
+        no está disponible o faltan columnas OHLC.
+    levels: lista de {"y": float, "label": str, "color": str, "dash": str}.
+    """
+    needed = {"open", "high", "low", "close"}
+    if df is None or df.empty or not needed.issubset(df.columns):
+        if df is not None and not df.empty and "close" in df.columns:
+            st.line_chart(df.set_index(df.columns[0])["close"] if "close" in df.columns else df)
+        else:
+            st.info("Sin datos OHLC para graficar.")
+        return
+
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        st.line_chart(df[["close"]])
+        return
+
+    data = df.tail(max_bars).copy()
+    x_col = "time" if "time" in data.columns else ("date" if "date" in data.columns else None)
+    x = data[x_col] if x_col else data.index
+
+    up, down = "#26a69a", "#ef5350"
+    has_vol = show_volume and "volume" in data.columns and data["volume"].fillna(0).abs().sum() > 0
+
+    if has_vol:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.78, 0.22], vertical_spacing=0.02,
+        )
+    else:
+        fig = make_subplots(rows=1, cols=1)
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x, open=data["open"], high=data["high"], low=data["low"], close=data["close"],
+            increasing_line_color=up, decreasing_line_color=down,
+            increasing_fillcolor=up, decreasing_fillcolor=down,
+            line_width=1, name="GGAL", showlegend=False,
+        ),
+        row=1, col=1,
+    )
+
+    sma_palette = ["#f5b301", "#4f9bff", "#b06bff"]
+    if smas:
+        for i, (label, period) in enumerate(smas.items()):
+            if len(data) >= period:
+                ma = data["close"].rolling(period).mean()
+                fig.add_trace(
+                    go.Scatter(
+                        x=x, y=ma, mode="lines", name=label,
+                        line=dict(color=sma_palette[i % len(sma_palette)], width=1.2),
+                    ),
+                    row=1, col=1,
+                )
+
+    if levels:
+        for lv in levels:
+            y = lv.get("y")
+            if y is None or y <= 0:
+                continue
+            fig.add_hline(
+                y=y, line_color=lv.get("color", "#9ca3af"),
+                line_dash=lv.get("dash", "dash"), line_width=1.1,
+                annotation_text=lv.get("label", ""),
+                annotation_position="right",
+                annotation_font_color=lv.get("color", "#9ca3af"),
+                annotation_font_size=11,
+                row=1, col=1,
+            )
+
+    if has_vol:
+        vol_colors = [up if c >= o else down for o, c in zip(data["open"], data["close"])]
+        fig.add_trace(
+            go.Bar(x=x, y=data["volume"], marker_color=vol_colors, opacity=0.5,
+                   name="Vol", showlegend=False),
+            row=2, col=1,
+        )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=height,
+        margin=dict(l=8, r=56, t=28 if title else 8, b=8),
+        title=dict(text=title, font=dict(size=14, color="#d4d4d8")) if title else None,
+        paper_bgcolor="#0e0e12", plot_bgcolor="#0e0e12",
+        xaxis_rangeslider_visible=False,
+        showlegend=bool(smas),
+        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=11),
+                    bgcolor="rgba(0,0,0,0)"),
+        hovermode="x unified",
+        dragmode="pan",
+    )
+    fig.update_xaxes(showgrid=False, color="#71717a", row=1, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)",
+                     color="#71717a", side="right", row=1, col=1)
+    if has_vol:
+        fig.update_xaxes(showgrid=False, color="#71717a", row=2, col=1)
+        fig.update_yaxes(showgrid=False, color="#71717a", side="right",
+                         showticklabels=False, row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True, config={
+        "displayModeBar": False, "scrollZoom": True,
+    })
 
 
 # ── Tab: Inicio ───────────────────────────────────────────────────────────────
@@ -1033,18 +1172,15 @@ def _tab_directional(
                     color=["#00cec9"], height=130,
                 )
 
-    # ── Gráfico de precio con medias móviles ──────────────────────────────
+    # ── Gráfico de precio (velas diarias con medias) ──────────────────────
     close = spot_history["close"]
     dates = spot_history["date"]
-
-    sma5_s  = _sma(close, 5).values
-    sma20_s = _sma(close, 20).values
-    chart_df = pd.DataFrame({
-        "GGAL":    close.values,
-        "SMA(5)":  sma5_s,
-        "SMA(20)": sma20_s,
-    }, index=dates)
-    st.line_chart(chart_df, color=["#F59E0B", "#00b894", "#636e72"])
+    _candlestick_chart(
+        spot_history,
+        height=420,
+        smas={"SMA5": 5, "SMA20": 20},
+        max_bars=120,
+    )
 
     # ── Métricas clásicas ─────────────────────────────────────────────────
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1101,10 +1237,7 @@ def _tab_directional(
 
     # ── Idea direccional (opcion desnuda) ─────────────────────────────────
     st.subheader("Idea direccional")
-    st.warning(
-        "Las siguientes ideas son **especulativas**. El bot no tiene alpha direccional "
-        "validado. La pérdida máxima es la prima pagada. Solo operar con capital de riesgo."
-    )
+    st.caption("Especulativo, sin alpha validado. Pérdida máxima = prima pagada.")
 
     if context is None or chain is None:
         st.info("Sin contexto de mercado disponible.")
@@ -1195,6 +1328,60 @@ def _tab_directional(
 
 
 # ── Tab: Historial ────────────────────────────────────────────────────────────
+def _close_position_live(symbol: str, strategy: str, lotes: int, provider) -> None:
+    is_buy = "SHORT" in strategy
+    success = provider.send_order(symbol, is_buy, lotes, 0.0) # Using 0.0 for now, should pull quote for limit order
+    if success:
+        st.success(f"Orden de cierre enviada para {lotes} lotes de {symbol}")
+    else:
+        st.error(f"Error al enviar orden de cierre para {symbol}")
+
+def _tab_portfolio(provider, chain, spot):
+    st.subheader("Portfolio Activo (Scalping)")
+    try:
+        from optionsdesk.signals.monitor import PositionMonitor
+        monitor = PositionMonitor(settings.open_positions_file)
+        positions = monitor.load_positions()
+    except Exception:
+        positions = []
+
+    if not positions:
+        st.info("No hay posiciones abiertas.")
+        return
+
+    rows = []
+    for p in positions:
+        quote = chain.options.get(p.symbol) if chain else None
+        mid = quote.mid if quote else p.spot_entry
+        pnl_gross = (mid - p.net_outlay) * p.contracts * 100 if "LONG" in p.strategy else (p.net_outlay - mid) * p.contracts * 100
+        # Comisiones IOL aprox 0.5% + IVA
+        commissions = (p.net_outlay * p.contracts * 100 * 0.005 * 1.21) + (mid * p.contracts * 100 * 0.005 * 1.21)
+        pnl_net = pnl_gross - commissions
+        pnl_pct = (pnl_net / (p.net_outlay * p.contracts * 100)) * 100 if p.net_outlay > 0 else 0.0
+        
+        rows.append({
+            "Símbolo": p.symbol,
+            "Estrategia": p.strategy,
+            "Lotes": p.contracts,
+            "Entrada": _scalp_money(p.net_outlay, 2),
+            "Mark (Mid)": _scalp_money(mid, 2),
+            "Comisiones": _scalp_money(commissions, 2),
+            "PnL Neto": _scalp_money(pnl_net, 2),
+            "PnL %": f"{pnl_pct:+.2f}%",
+        })
+
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+
+    st.markdown("### Acciones Rápidas")
+    cols = st.columns(min(4, len(positions)))
+    for i, p in enumerate(positions[:4]):
+        with cols[i]:
+            st.markdown(f"**{p.symbol}**")
+            if st.button("Cerrar Posición", key=f"close_{p.symbol}_{i}", type="secondary"):
+                _close_position_live(p.symbol, p.strategy, p.contracts, provider)
+                st.rerun()
 
 def _tab_history() -> None:
     snapshots_dir = Path("data/snapshots")
@@ -1223,32 +1410,415 @@ def _tab_history() -> None:
         st.error(f"Error cargando historial: {exc}")
 
 
-# ── Footer con auto-refresh via fragment ─────────────────────────────────────
+# ── Tab: Scalping ─────────────────────────────────────────────────────────────
 
-@st.fragment(run_every=2)
-def _auto_refresh_footer() -> None:
-    """Actualiza el contador y dispara rerun de la app cuando los datos vencen.
+def _scalp_money(value: float | int | None, decimals: int = 0) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"${float(value):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "-"
 
-    Al usar @st.fragment(run_every=2) el resto de la pagina queda idle —
-    sin spinner — y el screenshot / preview funciona correctamente.
-    """
-    rs: int = st.session_state.get("_refresh_s", 60)
-    elapsed = time.time() - st.session_state.get("last_fetch", time.time())
-    remaining = max(0, rs - elapsed)
 
+def _scalp_pct(value: float | int | None, decimals: int = 1, signed: bool = False) -> str:
+    if value is None:
+        return "-"
+    try:
+        sign = "+" if signed else ""
+        return f"{float(value):{sign}.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _scalp_card(label: str, value: str, tag: str, color: str) -> str:
+    return (
+        f"<div style='background:rgba(26,26,36,0.85);border:1px solid {color}33;"
+        f"border-radius:8px;padding:10px 12px;min-height:88px;'>"
+        f"<div style='font-size:0.62rem;color:#71717A;text-transform:uppercase;"
+        f"letter-spacing:.07em;margin-bottom:4px;font-family:JetBrains Mono,monospace;'>{label}</div>"
+        f"<div style='font-size:1.2rem;font-weight:700;color:#FAFAFA;line-height:1.15;'>{value}</div>"
+        f"<div style='font-size:0.72rem;color:{color};font-weight:600;margin-top:5px;'>{tag}</div>"
+        f"</div>"
+    )
+
+
+def _signal_color(sig) -> str:
+    if getattr(sig, "confidence", "") == "actionable":
+        return "#22c55e"
+    if any("stale" in f or "capital" in f or "spread" in f for f in getattr(sig, "risk_flags", [])):
+        return "#ef4444"
+    return "#f59e0b"
+
+
+def _execute_scalp_trade_live(sig, spot: float, lotes: int, tna: float, provider) -> None:
+    is_buy = sig.action.startswith("BUY")
+    price = sig.ask if is_buy else sig.bid
+    success = provider.send_order(sig.symbol, is_buy, lotes, price)
+    if not success:
+        st.error(f"Fallo al enviar la orden real a IOL para {sig.symbol}. Verifica logs.")
+        return
+    # Si la orden se envío bien, la registramos localmente en el monitor
+    _simulate_scalp_trade(sig, spot, lotes, tna)
+
+def _simulate_scalp_trade(sig, spot: float, lotes: int, tna: float) -> None:
+    import json
+    from datetime import date
+
+    file = settings.open_positions_file
+    file.parent.mkdir(parents=True, exist_ok=True)
+
+    strat = (
+        "SCALP_LONG_CALL" if sig.action == "BUY_CALL"
+        else "SCALP_LONG_PUT" if sig.action == "BUY_PUT"
+        else "SCALP_SHORT_CALL" if sig.action == "SELL_CALL"
+        else "SCALP_SHORT_PUT"
+    )
+    is_long = "LONG" in strat
+    entry = float(sig.plan_entry or sig.mid or 0.0)
+    stop_frac = abs(entry - float(sig.plan_sl or 0.0)) / entry if entry > 0 else 0.35
+    target_pct = ((float(sig.plan_tp or entry) - entry) / entry * 100.0) if is_long and entry > 0 else 50.0
+
+    pos = {
+        "symbol": sig.symbol,
+        "strategy": strat,
+        "strike": sig.strike,
+        "spot_entry": spot,
+        "premium_received": -entry if is_long else entry,
+        "net_outlay": entry if is_long else max(sig.max_loss_ars / 100.0, entry),
+        "iv_entry": sig.iv or 0.0,
+        "days_entry": max(int(sig.days_to_expiry), 1),
+        "entry_date": date.today().isoformat(),
+        "target_exit_days": max(min(int(sig.days_to_expiry), 2), 1),
+        "target_capture_pct": max(min(target_pct, 80.0), 15.0),
+        "caucion_tna": tna,
+        "contracts": int(lotes),
+        "max_loss_mult": max(min(stop_frac, 0.80), 0.10),
+        "roll_dte": 2,
+        "defend_delta": 0.65,
+        "scalp_plan_entry": sig.plan_entry,
+        "scalp_plan_sl": sig.plan_sl,
+        "scalp_plan_tp": sig.plan_tp,
+        "scalp_plan_rr": sig.plan_rr,
+        "scalp_pop": sig.probability_of_profit,
+        "scalp_expected_value_ars": sig.expected_value_ars,
+        "scalp_edge_r": getattr(sig, "edge_r", 0.0),
+        "scalp_fill_probability": getattr(sig, "fill_probability", 0.0),
+        "scalp_cost_to_target_pct": getattr(sig, "cost_to_target_pct", 0.0),
+        "scalp_time_stop_min": getattr(sig, "time_stop_min", 20),
+    }
+    with file.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(pos, ensure_ascii=False) + "\n")
+
+
+def _tab_scalping(
+    chain: OptionsChain,
+    spot: float,
+    provider: MarketDataProvider,
+    context,
+    expiry_calendar: dict,
+    spot_history_df: Optional[pd.DataFrame],
+    capital: Optional[float],
+    risk_profile: str,
+    caucion_tna: float,
+    ltf_df: Optional[pd.DataFrame] = None,
+) -> None:
+    from optionsdesk.signals.scalping import scan_all
+
+    try:
+        from optionsdesk.signals.monitor import PositionMonitor
+        positions = PositionMonitor(settings.open_positions_file).load_positions()
+    except Exception:
+        positions = []
+
+    st.subheader("Scalping & Momentum")
+    st.caption("Mesa de scalping intradía. El botón EJECUTAR EN MERCADO envía orden real a IOL.")
+
+    ctl_cap, ctl_refresh = st.columns([3, 1])
+    with ctl_cap:
+        capital_default = int(st.session_state.get("scalp_capital", capital or settings.default_capital or 0) or 0)
+        capital_input = st.number_input(
+            "Capital máximo para scalping (ARS)",
+            min_value=0,
+            max_value=100_000_000,
+            value=capital_default,
+            step=50_000,
+            help="Este capital define sizing, riesgo por trade y bloqueo de señales reales.",
+            key="capital_scalping_main",
+        )
+        capital = float(capital_input) if capital_input > 0 else None
+        st.session_state["scalp_capital"] = float(capital_input or 0)
+    with ctl_refresh:
+        st.write("")
+        if st.button("Actualizar datos", key="btn_refresh_scalping", use_container_width=True):
+            st.session_state["force_refresh"] = True
+            st.rerun()
+
+    realized_vol = None
+    if spot_history_df is not None and not spot_history_df.empty:
+        try:
+            from optionsdesk.signals.volatility import yang_zhang_volatility, realized_volatility
+            realized_vol = yang_zhang_volatility(spot_history_df, window=20)
+            if realized_vol is None and "close" in spot_history_df.columns:
+                realized_vol = realized_volatility(spot_history_df["close"].dropna().tolist(), window=20)
+        except Exception:
+            realized_vol = None
+
+    snap = None
+    if context is not None:
+        snap = getattr(context, "ltf_snap", None) or getattr(context, "snap", None)
+
+    try:
+        greeks, signals = scan_all(
+            chain,
+            expiry_calendar,
+            snap=snap,
+            realized_vol=realized_vol,
+            r=0.0,
+            capital=capital,
+            positions=positions,
+            risk_profile=risk_profile,
+        )
+    except Exception as exc:
+        st.error(f"Scalping no pudo escanear la cadena: {exc}")
+        return
+
+    actionables = [s for s in signals if s.confidence == "actionable"]
+    watchlist = [s for s in signals if s.confidence != "actionable"]
+    tradeable = [g for g in greeks.values() if g.is_tradeable]
+    health = provider.get_health()
+
+    if not capital or capital <= 0:
+        actionables = []
+
+    h1, h2, h3, h4, h5, h6 = st.columns(6)
+    latency = f"{health.last_latency_ms:.0f} ms" if health.last_latency_ms is not None else "-"
+
+    now_ba = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    session_end = now_ba.replace(hour=17, minute=0, second=0, microsecond=0)
+    mins_left = max((session_end - now_ba).total_seconds() / 60, 0)
+    session_color = "#22c55e" if mins_left > 30 else ("#f59e0b" if mins_left > 10 else "#ef4444")
+    session_phase = getattr(snap, "session_phase", None) if snap else None
+    if session_phase is None:
+        h = now_ba.hour + now_ba.minute / 60
+        session_phase = "cerrada" if (h < 11 or h >= 17) else ("apertura" if h < 11.33 else ("cierre" if h >= 16.75 else "regular"))
+
+    h1.markdown(_scalp_card("FEED", health.source, "conectado" if health.connected else "revisar", "#22c55e" if health.connected else "#ef4444"), unsafe_allow_html=True)
+    h2.markdown(_scalp_card("LATENCIA", latency, f"timeouts {health.timeouts}", "#22c55e" if not health.timeouts else "#f59e0b"), unsafe_allow_html=True)
+    h3.markdown(_scalp_card("CADENA", f"{len(tradeable)}/{len(greeks)}", "operable/parseada", "#22c55e" if tradeable else "#ef4444"), unsafe_allow_html=True)
+    h4.markdown(_scalp_card("SESIÓN", f"{int(mins_left)}m", session_phase, session_color), unsafe_allow_html=True)
+    h5.markdown(_scalp_card("RV 20D", f"{realized_vol * 100:.1f}%" if realized_vol else "-", "Yang-Zhang/close", "#71717a"), unsafe_allow_html=True)
+    h6.markdown(_scalp_card("ACCIONABLES", str(len(actionables)), f"watchlist {len(watchlist)}", "#22c55e" if actionables else "#71717a"), unsafe_allow_html=True)
+
+    preflight = []
+    if not settings.is_iol_configured() or health.source != "IOL":
+        preflight.append("No estás usando IOL como fuente primaria; tratá cualquier señal como radar.")
+    if capital is None or capital <= 0:
+        preflight.append("Cargá capital disponible para sizing real por riesgo.")
+    if snap is None:
+        preflight.append("Falta contexto intradiario: sin ola/rebote confirmado, las señales quedan degradadas.")
+    if realized_vol is None:
+        preflight.append("Falta volatilidad realizada: gamma scalp queda menos confiable.")
+    if health.timeouts:
+        preflight.append(f"El feed tuvo {health.timeouts} timeout(s). No operes si el dato se congela.")
+
+    if preflight:
+        st.warning("Pre-flight: " + " | ".join(preflight))
+    else:
+        st.success("Pre-flight OK: feed, contexto, volatilidad y sizing disponibles.")
+
+    # ── Gráfico de velas intradía con niveles de la señal ─────────────────────
+    intraday = ltf_df is not None and not ltf_df.empty
+    chart_df = ltf_df if intraday else spot_history_df
+    levels = [{"y": spot, "label": f"GGAL ${spot:,.0f}", "color": "#9ca3af", "dash": "dot"}]
+    chart_sig = None
+    if actionables:
+        labels = [
+            f"{s.action} {s.symbol} · PoP {s.probability_of_profit * 100:.0f}% · R:R {s.plan_rr:.1f}"
+            for s in actionables
+        ]
+        pick = st.selectbox(
+            "Señal sobre el gráfico",
+            range(len(actionables)),
+            format_func=lambda i: labels[i],
+            key="scalp_chart_pick",
+        )
+        chart_sig = actionables[pick]
+        if chart_sig.underlying_target > 0:
+            levels.append({"y": chart_sig.underlying_target, "label": f"TP ${chart_sig.underlying_target:,.0f}", "color": "#26a69a", "dash": "dash"})
+        if chart_sig.underlying_stop > 0:
+            levels.append({"y": chart_sig.underlying_stop, "label": f"Stop ${chart_sig.underlying_stop:,.0f}", "color": "#ef5350", "dash": "dash"})
+
+    _candlestick_chart(
+        chart_df,
+        height=400,
+        smas={"SMA9": 9, "SMA20": 20},
+        levels=levels,
+        max_bars=120 if intraday else 60,
+    )
+    st.caption(
+        "Velas intradía GGAL con tu entrada/stop/TP proyectados sobre el subyacente."
+        if intraday else
+        "Sin intradía ahora (fuera de horario o sin feed): se muestra el diario."
+    )
+
+    if actionables:
+        best = actionables[0]
+        st.markdown("### Mejor trade por PoP viable")
+        st.success(
+            f"{best.action} {best.symbol} | PoP {best.probability_of_profit * 100:.0f}% | "
+            f"EV/lote {_scalp_money(best.expected_value_ars)} | "
+            f"Edge/R {getattr(best, 'edge_r', 0.0):+.2f} | "
+            f"Friccion/target {getattr(best, 'cost_to_target_pct', 0.0):.1f}%"
+        )
+        st.caption(
+            "Seleccionado por: actionable > PoP > EV/riesgo > menor friccion > liquidez > score."
+        )
+
+    st.markdown("### Señales accionables")
+    if not actionables:
+        st.info("No hay trades liberados ahora. Esto es deseable si el dato, el spread o el contexto no dan ventaja neta.")
+    else:
+        cols = st.columns(min(3, len(actionables)))
+        for i, sig in enumerate(actionables[:3]):
+            color = _signal_color(sig)
+            with cols[i]:
+                st.markdown(
+                    f"<div style='background:rgba(26,26,36,0.86);border-top:3px solid {color};"
+                    f"border-radius:8px;padding:12px;'>"
+                    f"<div style='font-size:0.72rem;color:#71717A;text-transform:uppercase;'>{sig.playbook} - {sig.confidence}</div>"
+                    f"<div style='font-size:1.2rem;font-weight:700;margin-top:2px;'>{sig.action} {sig.symbol}</div>"
+                    f"<div style='font-size:0.78rem;color:{color};font-weight:600;margin-top:4px;'>{sig.expected_move}</div>"
+                    f"<div style='font-size:0.78rem;color:#d4d4d8;margin-top:8px;line-height:1.35;'>{sig.rationale}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                with st.expander("Ticket manual", expanded=True):
+                    valid_txt = sig.valid_until.split("T")[-1][:8] if sig.valid_until else "-"
+                    st.write(f"Entrada límite: **{_scalp_money(sig.plan_entry, 2)}** ({sig.entry_style})")
+                    st.write(f"Stop opción: **{_scalp_money(sig.plan_sl, 2)}** | TP opción: **{_scalp_money(sig.plan_tp, 2)}**")
+                    st.write(f"Stop GGAL: **{_scalp_money(sig.underlying_stop, 2)}** | TP GGAL: **{_scalp_money(sig.underlying_target, 2)}**")
+                    st.caption(
+                        f"PoP {sig.probability_of_profit * 100:.0f}% | EV/lote {_scalp_money(sig.expected_value_ars)} | "
+                        f"R:R {sig.plan_rr:.2f} | Riesgo stop/lote {_scalp_money(sig.planned_risk_ars)} | "
+                        f"Fricción {_scalp_money(sig.friction_ars)} ({sig.friction_pct:.2f}%) | "
+                        f"Fill {getattr(sig, 'fill_probability', 0.0) * 100:.0f}% | "
+                        f"Time stop {getattr(sig, 'time_stop_min', 20)} min | válido hasta {valid_txt}"
+                    )
+                    if getattr(sig, "warning_flags", []):
+                        st.caption("Advertencias: " + ", ".join(sig.warning_flags))
+                    default_lotes = max(int(sig.suggested_lots or 1), 1)
+                    if sig.suggested_lots <= 0:
+                        st.error("Sizing bloqueado: cargá capital o bajá riesgo antes de registrar.")
+                        continue
+                    lotes = st.number_input(
+                        "Lotes",
+                        min_value=1,
+                        max_value=max(int(sig.suggested_lots), 1),
+                        value=default_lotes,
+                        step=1,
+                        key=f"scalp_lotes_{sig.symbol}_{i}",
+                    )
+                    if st.button("EJECUTAR EN MERCADO", key=f"scalp_reg_{sig.symbol}_{i}", type="primary"):
+                        _execute_scalp_trade_live(sig, spot, lotes, caucion_tna, provider)
+                        st.success("¡Orden ENVIADA A IOL y registrada en Portfolio!")
+
+    def _signals_df(items: list) -> pd.DataFrame:
+        rows = []
+        for s in items:
+            g = greeks.get(s.symbol)
+            rows.append({
+                "Estado": s.confidence,
+                "Acción": s.action,
+                "Símbolo": s.symbol,
+                "Setup": s.playbook or s.signal_type,
+                "Score": round(s.score, 1),
+                "PoP": f"{s.probability_of_profit * 100:.0f}%",
+                "EV/lote": _scalp_money(s.expected_value_ars),
+                "Entrada": _scalp_money(s.plan_entry, 2),
+                "Stop": _scalp_money(s.plan_sl, 2),
+                "TP": _scalp_money(s.plan_tp, 2),
+                "R:R": f"{s.plan_rr:.2f}",
+                "Riesgo/lote": _scalp_money(s.planned_risk_ars),
+                "Fricción": _scalp_money(s.friction_ars),
+                "Edge/R": f"{getattr(s, 'edge_r', 0.0):+.2f}",
+                "Fill": f"{getattr(s, 'fill_probability', 0.0) * 100:.0f}%",
+                "Costo/target": f"{getattr(s, 'cost_to_target_pct', 0.0):.1f}%",
+                "BE mov": f"{s.breakeven_move_pct:.2f}%",
+                "Spread": f"{s.spread_pct:.1f}%",
+                "Edad": f"{getattr(g, 'quote_age_s', 0.0):.0f}s" if g else "-",
+                "Bloqueos": ", ".join(getattr(s, "blocking_flags", [])) if getattr(s, "blocking_flags", []) else "-",
+                "Advertencias": ", ".join(getattr(s, "warning_flags", [])) if getattr(s, "warning_flags", []) else "-",
+            })
+        return pd.DataFrame(rows)
+
+    if actionables:
+        st.dataframe(_signals_df(actionables), hide_index=True, use_container_width=True)
+
+    st.markdown("### Watchlist")
+    if not watchlist:
+        st.info("Watchlist vacía.")
+    else:
+        reason_counts: dict[str, int] = {}
+        for s in watchlist:
+            for flag in getattr(s, "blocking_flags", []) or s.risk_flags:
+                reason_counts[flag] = reason_counts.get(flag, 0) + 1
+        if reason_counts:
+            top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            st.caption("Bloqueos principales: " + " | ".join(f"{k} ({v})" for k, v in top_reasons))
+        st.dataframe(_signals_df(watchlist[:40]), hide_index=True, use_container_width=True)
+
+    with st.expander("Auditoria / backtest scalping", expanded=False):
+        snap_dir = settings.snapshots_dir
+        files = list(snap_dir.glob("**/*.parquet")) if snap_dir.exists() else []
+        if files:
+            st.write(f"Snapshots disponibles para replay: **{len(files)}** archivos.")
+            st.caption(
+                "El motor optionsdesk.backtest.scalping replayea planes sin lookahead: "
+                "entrada posterior a la senal, compra al ask, salida al bid, costos, TP, SL y time stop."
+            )
+        else:
+            st.info("Sin snapshots intradiarios todavia. El recorder debe acumular data antes de auditar parametros reales.")
+
+    with st.expander("Griegas de la cadena y calidad de quotes", expanded=False):
+        rows = []
+        for g in sorted(greeks.values(), key=lambda x: (x.days, abs(x.moneyness_pct), x.symbol)):
+            rows.append({
+                "Símbolo": g.symbol,
+                "Tipo": "CALL" if g.option_type == "C" else "PUT",
+                "Strike": g.strike,
+                "DTE": g.days,
+                "Bid": g.bid,
+                "Ask": g.ask,
+                "Mid": g.mid,
+                "Spread %": g.spread_pct,
+                "IV %": f"{g.iv * 100:.1f}%" if g.iv else "-",
+                "Delta": g.delta,
+                "Gamma": g.gamma,
+                "Theta": g.theta,
+                "Vol": g.volume,
+                "Edad quote": f"{g.quote_age_s:.0f}s",
+                "Operable": g.is_tradeable,
+                "Motivo": g.liquidity_reason or "ok",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("No se pudieron calcular griegas parseables para la cadena actual.")
+
+
+# ── Footer manual ─────────────────────────────────────────────────────────────
+
+def _data_footer() -> None:
+    """Pie estable: no fuerza reruns ni parpadeos."""
+    last_fetch = st.session_state.get("last_fetch_label", "sin cargar")
     col_foot1, col_foot2 = st.columns([4, 1])
     with col_foot1:
-        st.caption(
-            f"Datos: {pd.Timestamp.now().strftime('%H:%M:%S')} — "
-            f"proxima actualizacion en {remaining:.0f}s"
-        )
+        st.caption(f"Datos cargados: {last_fetch}")
     with col_foot2:
-        if st.button("Actualizar ahora", key="btn_refresh_main"):
-            st.session_state.pop("last_fetch", None)
-            st.rerun(scope="app")
-
-    if remaining <= 0:
-        st.rerun(scope="app")
+        if st.button("Actualizar datos", key="btn_refresh_main"):
+            st.session_state["force_refresh"] = True
+            st.rerun()
 
 
 # ── App principal ─────────────────────────────────────────────────────────────
@@ -1266,33 +1836,45 @@ def main() -> None:
         st.header("OptionsDesk")
 
         demo_mode = st.toggle(
-            "Modo demo", value=not settings.is_configured(),
+            "Modo demo", value=not (settings.is_iol_configured() or settings.is_configured()),
             help="Datos sinteticos. Activa cuando no hay credenciales.",
         )
-        refresh_s = st.slider("Refresh (seg)", 15, 300, 60)
+        if st.button("Actualizar datos", key="btn_refresh_sidebar", use_container_width=True):
+            st.session_state["force_refresh"] = True
+            st.rerun()
+        scalp_profile = st.selectbox(
+            "Perfil scalping",
+            ["balanced", "conservative", "aggressive"],
+            index=0,
+            help="balanced es el default para operar manualmente con dinero real.",
+        )
 
         st.divider()
 
+        capital_default = int(st.session_state.get("scalp_capital", settings.default_capital or 0) or 0)
         capital_input = st.number_input(
             "Capital disponible (ARS)",
             min_value=0,
             max_value=100_000_000,
-            value=int(settings.default_capital or 0),
+            value=capital_default,
             step=50_000,
             help="Para calcular cuantos lotes entran y la ganancia estimada en pesos.",
+            key="capital_sidebar",
         )
         capital = float(capital_input) if capital_input > 0 else None
+        st.session_state["scalp_capital"] = float(capital_input or 0)
 
         directional_on = st.toggle(
             "Contexto de mercado (experimental)",
-            value=settings.directional_enabled,
+            value=True,
             help="Ajuste leve basado en tendencia. Mejora con historial acumulado.",
         )
 
         advanced_mode = st.toggle(
             "Modo avanzado",
             value=False,
-            help="Desbloquea Cadena completa, Simulador P&L e Historial.",
+            help="Suma tabs de análisis de tasas: Inicio, Oportunidades, Aprende, "
+                 "Cadena completa, Simulador P&L e Historial.",
         )
 
         # Filtros: solo visibles en modo avanzado
@@ -1337,20 +1919,19 @@ def main() -> None:
     screener = Screener(ScreenerConfig(min_tna_spread_pct=min_spread))
     alerter = TelegramAlerter()
 
-    # ── Datos (cacheados hasta que vence el intervalo) ────────────────────────
-    now = time.time()
-    if (now - st.session_state.get("last_fetch", 0.0)) >= refresh_s or "chain" not in st.session_state:
-        st.session_state.chain = provider.get_options_chain()
-        st.session_state.caucion_tna = provider.get_caucion_tna() or 0.0
-        st.session_state.last_fetch = now
+    # ── Datos: carga inicial + refresh manual, sin parpadeo por auto-rerun ─────
+    force_refresh = bool(st.session_state.pop("force_refresh", False))
+    if force_refresh or "chain" not in st.session_state:
+        with st.spinner("Cargando datos de mercado..."):
+            st.session_state.chain = provider.get_options_chain()
+            st.session_state.caucion_tna = provider.get_caucion_tna() or settings.default_caucion_tna
+            st.session_state.last_fetch_label = pd.Timestamp.now().strftime("%H:%M:%S")
 
     chain: Optional[OptionsChain] = st.session_state.chain
     caucion_tna: float = st.session_state.caucion_tna
 
     if chain is None:
         st.error("Sin datos de mercado. Verifica la conexion o activa modo demo.")
-        time.sleep(2)
-        st.rerun()
         return
 
     benchmark = (
@@ -1377,21 +1958,20 @@ def main() -> None:
     )
 
     # ── Contexto de mercado (opcional) ────────────────────────────────────────
-    context = None
-    if directional_on:
-        from optionsdesk.signals.directional import compute_market_context
-        ctx_data = spot_history_df if spot_history_df is not None else None
-        context = compute_market_context(ctx_data, htf=htf_df, ltf=ltf_df)
+    from optionsdesk.signals.directional import compute_market_context
+    ctx_data = spot_history_df if spot_history_df is not None else None
+    context = compute_market_context(ctx_data, htf=htf_df, ltf=ltf_df)
+    recommender_context = context if directional_on else None
 
     # ── Recomendaciones ───────────────────────────────────────────────────────
     recommender = Recommender()
     recs = recommender.recommend(
-        cc_all, sp_all, benchmark, context=context, capital=capital,
+        cc_all, sp_all, benchmark, context=recommender_context, capital=capital,
         spot_history=spot_history_list, top_n=3,
     )
 
     # ── Header ───────────────────────────────────────────────────────────────
-    st.title("OptionsDesk — Tasa implicita GGAL")
+    st.title("OptionsDesk — Scalping GGAL")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("GGAL", f"${spot:,.0f}")
@@ -1401,37 +1981,40 @@ def main() -> None:
     c5.metric("Hora", pd.Timestamp.now().strftime("%H:%M:%S"), delta_color="off")
 
     if context is not None:
-        conf_badge = {
-            "alta": "alta confianza",
-            "media": "confianza media",
-            "baja": "baja confianza",
-            "sin datos": "sin datos",
-        }.get(context.confidence, context.confidence)
-        color = "normal" if context.confidence == "sin datos" else "info"
         st.info(f"Mercado: {context.note}")
 
     st.divider()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
+    # Operatoria diaria: Scalping, Portfolio y Direccional. El resto (análisis
+    # de tasas, tutoriales, simuladores) queda detrás de "Modo avanzado".
     if advanced_mode:
         tab_labels = [
-            "Inicio", "Oportunidades", "Direccional", "Aprende",
+            "Scalping", "Portfolio", "Direccional",
+            "Inicio", "Oportunidades", "Aprende",
             "Cadena completa", "Simulador P&L", "Historial",
         ]
-        t_home, t_ops, t_dir, t_learn, t_chain, t_sim, t_hist = st.tabs(tab_labels)
+        (t_scalping, t_portfolio, t_dir, t_home, t_ops, t_learn,
+         t_chain, t_sim, t_hist) = st.tabs(tab_labels)
     else:
-        t_home, t_ops, t_dir, t_learn = st.tabs(
-            ["Inicio", "Oportunidades", "Direccional", "Aprende"]
+        t_scalping, t_portfolio, t_dir = st.tabs(["Scalping", "Portfolio", "Direccional"])
+
+    with t_scalping:
+        _tab_scalping(
+            chain=chain,
+            spot=spot,
+            provider=provider,
+            context=context,
+            expiry_calendar=expiry_cal,
+            spot_history_df=spot_history_df,
+            capital=capital,
+            risk_profile=scalp_profile,
+            caucion_tna=caucion_tna,
+            ltf_df=ltf_df,
         )
 
-    with t_home:
-        _tab_home(recs, alerter)
-
-    with t_ops:
-        _tab_opportunities(
-            cc_all, sp_all, cc_filtered, sp_filtered,
-            show_all, caucion_tna, send_alerts, alerter,
-        )
+    with t_portfolio:
+        _tab_portfolio(provider, chain, spot)
 
     with t_dir:
         _tab_directional(
@@ -1441,10 +2024,16 @@ def main() -> None:
             benchmark=benchmark,
         )
 
-    with t_learn:
-        _tab_learn()
-
     if advanced_mode:
+        with t_home:
+            _tab_home(recs, alerter)
+        with t_ops:
+            _tab_opportunities(
+                cc_all, sp_all, cc_filtered, sp_filtered,
+                show_all, caucion_tna, send_alerts, alerter,
+            )
+        with t_learn:
+            _tab_learn()
         with t_chain:
             _tab_chain(chain, spot)
         with t_sim:
@@ -1452,10 +2041,8 @@ def main() -> None:
         with t_hist:
             _tab_history()
 
-    # ── Footer y auto-refresh ─────────────────────────────────────────────────
-    # Guardamos refresh_s en session_state para que el fragment lo lea
-    st.session_state["_refresh_s"] = refresh_s
-    _auto_refresh_footer()
+    # ── Footer manual ─────────────────────────────────────────────────────────
+    _data_footer()
 
 
 if __name__ == "__main__":

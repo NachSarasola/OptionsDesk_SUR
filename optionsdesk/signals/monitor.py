@@ -55,6 +55,12 @@ class OpenPosition:
     target_exit_days: int
     target_capture_pct: float
     caucion_tna: float = 60.0
+    # Parámetros de gestión activa (v2.4) — retrocompatibles via .get() con defaults
+    max_loss_mult: float = 2.0   # stop a max_loss_mult × prima cobrada
+    roll_dte: int = 21           # señal de roll cuando quedan ≤ roll_dte días
+    defend_delta: float = 0.50   # señal de defensa cuando |delta| ≥ defend_delta
+    # Cantidad de contratos abiertos (v3.1) — default 1 para retrocompatibilidad
+    contracts: int = 1
 
     @classmethod
     def from_dict(cls, d: dict) -> "OpenPosition":
@@ -71,6 +77,10 @@ class OpenPosition:
             target_exit_days=int(d["target_exit_days"]),
             target_capture_pct=float(d["target_capture_pct"]),
             caucion_tna=float(d.get("caucion_tna", 60.0)),
+            max_loss_mult=float(d.get("max_loss_mult", 2.0)),
+            roll_dte=int(d.get("roll_dte", 21)),
+            defend_delta=float(d.get("defend_delta", 0.50)),
+            contracts=int(d.get("contracts", 1)),
         )
 
     @property
@@ -83,7 +93,7 @@ class OpenPosition:
 
     @property
     def opt_type(self) -> str:
-        return "C" if self.strategy == "COVERED_CALL" else "P"
+        return "C" if "CALL" in self.strategy else "P"
 
 
 class PositionMonitor:
@@ -143,43 +153,49 @@ class PositionMonitor:
                 S, pos.strike, T_rem, r, pos.iv_entry, pos.opt_type, steps=_CRR_STEPS
             )
 
-        # P&L actual: lo que recibimos menos lo que cuesta recomprar
-        pnl_now = pos.premium_received - current_ov
-        # P&L al hold completo ≈ prima completa (opción expira OTM)
-        pnl_full = pos.premium_received
-
-        if pnl_full <= 0:
-            return 0.0
-        return max(pnl_now / pnl_full * 100.0, 0.0)
+        is_long = "LONG" in pos.strategy
+        if is_long:
+            pnl_now = current_ov - pos.net_outlay
+            return (pnl_now / pos.net_outlay * 100.0) if pos.net_outlay > 0 else 0.0
+        else:
+            pnl_now = pos.premium_received - current_ov
+            pnl_full = pos.premium_received
+            if pnl_full <= 0:
+                return 0.0
+            return max(pnl_now / pnl_full * 100.0, 0.0)
 
     def check_and_alert(
         self,
         positions: Optional[list[OpenPosition]] = None,
         current_spot: Optional[float] = None,
+        current_iv: Optional[float] = None,
     ) -> list[OpenPosition]:
-        """Evalúa cada posición y alerta las que alcanzaron su objetivo.
+        """Evalúa cada posición y alerta según la señal de gestión activa.
 
-        Devuelve la lista de posiciones alertadas.
+        Devuelve la lista de posiciones con señal accionable (no HOLD).
         """
+        from optionsdesk.signals.management import evaluate_position, SignalType
+
         if positions is None:
             positions = self.load_positions()
         triggered: list[OpenPosition] = []
         alerter = self._get_alerter()
+
         for pos in positions:
-            capture = self.compute_capture(pos, current_spot)
+            spot = current_spot or pos.spot_entry
+            signal = evaluate_position(pos, spot, current_iv)
+
             logger.debug(
-                "%s  captura=%.1f%%  objetivo=%.1f%%",
-                pos.symbol, capture, pos.target_capture_pct,
+                "%s  captura=%.1f%%  señal=%s",
+                pos.symbol, signal.capture_pct, signal.signal_type,
             )
-            if capture >= pos.target_capture_pct:
-                alerter.send_swing_target(
-                    symbol=pos.symbol,
-                    capture_pct=capture,
-                    target_pct=pos.target_capture_pct,
-                    strategy=pos.strategy,
-                    days_held=pos.days_held,
-                )
-                triggered.append(pos)
+
+            if signal.signal_type == SignalType.HOLD:
+                continue
+
+            alerter.send_management_signal(signal, pos)
+            triggered.append(pos)
+
         return triggered
 
     def run_once(self, current_spot: Optional[float] = None) -> None:

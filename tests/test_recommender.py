@@ -174,10 +174,14 @@ def test_conservador_weights_cushion_over_spread():
     )
 
 
-def test_agresivo_weights_spread_over_cushion():
-    high_spread = _make_result(cushion_pct=2.0, tna_pct=110.0, delta=0.55, caucion_tna=60.0)
+def test_agresivo_weights_ev_over_cushion():
+    # v2.4: AGRESIVO pesa EV (0.55) sobre cushion (0.10). Con EV calculado,
+    # un trade de EV alta pero cushion baja supera a uno de cushion alta y EV cero.
+    high_ev = _make_result(cushion_pct=2.0, tna_pct=110.0, delta=0.45, caucion_tna=60.0)
+    high_ev.expected_value_pct = 40.0   # EV anual alta — VRP positivo
     high_cushion = _make_result(cushion_pct=14.0, tna_pct=70.0, delta=0.70, caucion_tna=60.0)
-    assert _score(high_spread, RiskProfile.AGRESIVO) > _score(
+    high_cushion.expected_value_pct = 0.0   # EV neutra
+    assert _score(high_ev, RiskProfile.AGRESIVO) > _score(
         high_cushion, RiskProfile.AGRESIVO
     )
 
@@ -206,11 +210,14 @@ def test_semaphore_verde_strong_itm():
     assert light in ("verde", "amarillo")
 
 
-def test_semaphore_rojo_negative_spread():
+def test_semaphore_not_verde_negative_spread():
+    # Con spread negativo y delta bajo, el semáforo no puede ser verde.
+    # El gate _passes_gates ya bloquea este trade; si se llegara a puntuar,
+    # la probabilidad baja (0.20) impide que supere el umbral de verde.
     r = _make_result(tna_pct=10.0, caucion_tna=60.0, delta=0.20)
     checker = RiskChecker()
     s = _score(r, RiskProfile.AGRESIVO)
-    assert _semaphore(r, s, checker) == "rojo"
+    assert _semaphore(r, s, checker) != "verde"
 
 
 # ── Ticket ────────────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ from typing import Optional
 
 import requests
 
+from optionsdesk.config.settings import settings
 from optionsdesk.data.providers.base import MarketDataProvider, OptionsChain, Quote
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,10 @@ class BymaOpenProvider(MarketDataProvider):
         self._timeout = timeout_s
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "optionsdesk/0.1"})
+        # BYMA Open Data usa un cert intermedio que Python/Windows no resuelve por defecto
+        self._session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[object]:
         try:
@@ -81,13 +86,13 @@ class BymaOpenProvider(MarketDataProvider):
     def get_caucion_tna(self, days: int = 30) -> Optional[float]:
         data = self._get("repos")
         if not data:
-            return None
+            return settings.default_caucion_tna
         items = data if isinstance(data, list) else data.get("data", [])
         for item in items:
             rate = item.get("rate", item.get("tna"))
             if rate:
                 return float(rate)
-        return None
+        return settings.default_caucion_tna
 
     def is_connected(self) -> bool:
         return True

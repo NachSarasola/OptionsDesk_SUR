@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class OptionType(str, Enum):
@@ -59,18 +62,29 @@ _TICKER_RE = re.compile(
 def parse_option_symbol(
     symbol: str,
     expiry_calendar: dict[str, date],
+    spot_hint: Optional[float] = None,
 ) -> Optional[OptionContract]:
-    """Parsea un ticker de opción GGAL de BYMA.
+    """Parseador genérico de opciones.
 
-    Devuelve None si el formato no es reconocido o el código de vencimiento
-    no está en el calendario. El calendario se carga de instruments.yaml.
+    Extrae underlying, call/put, strike y expiration.
+    Si se provee spot_hint, corrige strikes desfasados de BYMA (multiplicados x10 o x100).
     """
     m = _TICKER_RE.match(symbol.strip().upper())
     if not m:
         return None
 
+    # Underlying fijo (GGAL por ahora)
+    underlying = "GGAL"
     otype = OptionType.CALL if m.group("otype").upper() == "C" else OptionType.PUT
     strike = float(m.group("strike").replace(",", "."))
+
+    # Corrección BYMA usando el spot
+    if spot_hint is not None and spot_hint > 0:
+        while strike > spot_hint * 3:
+            strike /= 10.0
+        while strike < spot_hint / 3:
+            strike *= 10.0
+
     code = m.group("code")
     expiration = expiry_calendar.get(code)
     if expiration is None:
@@ -96,7 +110,8 @@ def days_to_expiry(symbol: str, expiry_calendar: Optional[dict[str, date]] = Non
     if cal is None:
         try:
             cal = load_expiry_calendar()
-        except Exception:
+        except Exception as e:
+            logger.debug("load_expiry_calendar fallo en days_to_expiry: %s", e)
             return 0
     contract = parse_option_symbol(symbol, cal)
     return contract.days_to_expiry if contract is not None else 0

@@ -224,8 +224,12 @@ def test_weekly_limits_to_requested_weeks():
 
 
 def test_resample_static():
-    """_resample sobre un DataFrame de 14 dias debe dar <=2 velas semanales."""
+    """_resample sobre un DataFrame de 14 dias debe dar <=3 velas semanales.
+
+    El máximo es 3: si el rango arranca en sábado, el W-FRI abre un bin extra
+    al final. El caso más común es 2, pero 3 es correcto y esperado.
+    """
     df = _make_fresh_df(14)
     out = UnderlyingHistory._resample(df, "W-FRI")
-    assert len(out) <= 2
+    assert 1 <= len(out) <= 3
     assert "close" in out.columns

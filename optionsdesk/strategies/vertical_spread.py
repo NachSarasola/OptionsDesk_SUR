@@ -26,7 +26,7 @@ from optionsdesk.data.providers.base import OptionsChain, Quote
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SIGMA = 0.65   # vol anual de referencia si no se puede calcular IV
+from optionsdesk.config.constants import DEFAULT_SIGMA_GGAL as _DEFAULT_SIGMA
 
 
 @dataclass
@@ -62,19 +62,22 @@ class VerticalSpreadScanner:
         self,
         chain: OptionsChain,
         benchmark: Benchmark,
-        direction: str = "both",   # "bullish" | "bearish" | "both"
+        direction: str = "both",          # "bullish" | "bearish" | "both"
+        realized_vol: Optional[float] = None,  # vol realizada; None → IV de patas
     ) -> list[SpreadResult]:
-        """Devuelve spreads ordenados por risk_reward x PoP.
+        """Devuelve spreads ordenados por ev_return_pct descendente.
 
         direction: 'bullish' → solo bull spreads (call/put)
                    'bearish' → solo bear spreads (call/put)
                    'both'    → todos los lados
+        realized_vol: vol realizada para PoP/EV. Sin ella usa IV promedio de patas.
         """
         S = chain.spot.mid
         if S <= 0:
             return []
 
-        r = math.log(1.0 + benchmark.caucion_tna_pct / 100.0) if benchmark.caucion_tna_pct > 0 else 0.0
+        # drift=0: distribución física conservadora; la caución ya no contamina la PoP
+        r = 0.0
 
         # ── Agrupar opciones liquidas por (tipo, vencimiento) ─────────────────
         # key  : (OptionType, expiry_code, expiration_date, days)
@@ -109,8 +112,8 @@ class VerticalSpreadScanner:
                     )
                     if computed:
                         iv_val = computed
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("implied_vol fallo para %s: %s", sym, e)
 
             key = (contract.option_type, contract.expiry_code, contract.expiration, days)
             groups.setdefault(key, {})[contract.strike] = (sym, quote, iv_val)
@@ -124,62 +127,66 @@ class VerticalSpreadScanner:
             if len(strikes) < 2:
                 continue
 
-            for i in range(len(strikes) - 1):
-                K_lo, K_hi = strikes[i], strikes[i + 1]
-                if K_hi - K_lo > max_width:
-                    continue
+            for i in range(len(strikes)):
+                for j in range(i + 1, len(strikes)):
+                    K_lo, K_hi = strikes[i], strikes[j]
+                    if K_hi - K_lo > max_width:
+                        break  # strikes ordenado → todos los j>j* también superan
 
-                sym_lo, q_lo, iv_lo = strike_map[K_lo]
-                sym_hi, q_hi, iv_hi = strike_map[K_hi]
-                sigma = (iv_lo + iv_hi) / 2.0
+                    sym_lo, q_lo, iv_lo = strike_map[K_lo]
+                    sym_hi, q_hi, iv_hi = strike_map[K_hi]
+                    # Usa vol realizada si se pasa; si no, IV promedio de patas como fallback
+                    sigma = realized_vol if (realized_vol and realized_vol > 0) \
+                            else (iv_lo + iv_hi) / 2.0
 
-                kwargs = dict(
-                    expiration=expiration, days=days, spot=S,
-                    sigma=sigma, r=r,
-                    cost_model=self._cfg.cost_model,
-                    price_mode=self._cfg.price_mode,
-                )
+                    kwargs = dict(
+                        expiration=expiration, days=days, spot=S,
+                        sigma=sigma, r=r,
+                        cost_model=self._cfg.cost_model,
+                        price_mode="executable",   # fill realista: buy@ask / sell@bid
+                    )
 
-                if opt_type == OptionType.CALL:
-                    if direction in ("bullish", "both"):
-                        sr = build_bull_call_spread(
-                            sym_lo, K_lo, q_lo.bid, q_lo.ask,
-                            sym_hi, K_hi, q_hi.bid, q_hi.ask,
-                            **kwargs,
-                        )
-                        if sr:
-                            results.append(sr)
-                    if direction in ("bearish", "both"):
-                        sr = build_bear_call_spread(
-                            sym_lo, K_lo, q_lo.bid, q_lo.ask,
-                            sym_hi, K_hi, q_hi.bid, q_hi.ask,
-                            **kwargs,
-                        )
-                        if sr:
-                            results.append(sr)
+                    if opt_type == OptionType.CALL:
+                        if direction in ("bullish", "both"):
+                            sr = build_bull_call_spread(
+                                sym_lo, K_lo, q_lo.bid, q_lo.ask,
+                                sym_hi, K_hi, q_hi.bid, q_hi.ask,
+                                **kwargs,
+                            )
+                            if sr:
+                                results.append(sr)
+                        if direction in ("bearish", "both"):
+                            sr = build_bear_call_spread(
+                                sym_lo, K_lo, q_lo.bid, q_lo.ask,
+                                sym_hi, K_hi, q_hi.bid, q_hi.ask,
+                                **kwargs,
+                            )
+                            if sr:
+                                results.append(sr)
 
-                else:  # PUT
-                    if direction in ("bullish", "both"):
-                        # bull put: sell K_hi, buy K_lo
-                        sr = build_bull_put_spread(
-                            sym_hi, K_hi, q_hi.bid, q_hi.ask,
-                            sym_lo, K_lo, q_lo.bid, q_lo.ask,
-                            **kwargs,
-                        )
-                        if sr:
-                            results.append(sr)
-                    if direction in ("bearish", "both"):
-                        # bear put: buy K_hi, sell K_lo
-                        sr = build_bear_put_spread(
-                            sym_hi, K_hi, q_hi.bid, q_hi.ask,
-                            sym_lo, K_lo, q_lo.bid, q_lo.ask,
-                            **kwargs,
-                        )
-                        if sr:
-                            results.append(sr)
+                    else:  # PUT
+                        if direction in ("bullish", "both"):
+                            # bull put: sell K_hi, buy K_lo
+                            sr = build_bull_put_spread(
+                                sym_hi, K_hi, q_hi.bid, q_hi.ask,
+                                sym_lo, K_lo, q_lo.bid, q_lo.ask,
+                                **kwargs,
+                            )
+                            if sr:
+                                results.append(sr)
+                        if direction in ("bearish", "both"):
+                            # bear put: buy K_hi, sell K_lo
+                            sr = build_bear_put_spread(
+                                sym_hi, K_hi, q_hi.bid, q_hi.ask,
+                                sym_lo, K_lo, q_lo.bid, q_lo.ask,
+                                **kwargs,
+                            )
+                            if sr:
+                                results.append(sr)
 
-        # Score: risk_reward x PoP (premia R:R bueno con alta probabilidad)
-        results.sort(key=lambda x: x.risk_reward * x.prob_of_profit, reverse=True)
+        # Rankea por retorno esperado sobre riesgo: EV / max_loss * 100
+        # EV > 0 ⟺ el spread tiene edge con distribución física (drift=0, vol realizada)
+        results.sort(key=lambda x: x.ev_return_pct, reverse=True)
         return results
 
     def _is_liquid(self, quote: Quote) -> bool:

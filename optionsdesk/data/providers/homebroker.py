@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -32,6 +33,7 @@ class HomeBrokerProvider(MarketDataProvider):
         self._spot_data: Optional[dict] = None
         self._repos_data: list[dict] = []
         self._connected = False
+        self._last_update: float = 0.0   # epoch seconds del último callback recibido
 
     def connect(self) -> None:
         try:
@@ -101,6 +103,7 @@ class HomeBrokerProvider(MarketDataProvider):
                         "volume": float(row.get("trade_volume", row.get("volume", 0)) or 0),
                         "timestamp": datetime.now(),
                     }
+                self._last_update = time.time()
             except Exception as e:
                 logger.warning("Error procesando datos de opciones: %s", e)
 
@@ -119,6 +122,7 @@ class HomeBrokerProvider(MarketDataProvider):
                             "volume": float(row.get("trade_volume", row.get("volume", 0)) or 0),
                             "timestamp": datetime.now(),
                         }
+                        self._last_update = time.time()
                         break
             except Exception as e:
                 logger.warning("Error procesando datos de acciones: %s", e)
@@ -134,6 +138,32 @@ class HomeBrokerProvider(MarketDataProvider):
 
     def _on_error(self, online, error, msg) -> None:
         logger.error("HomeBroker error: %s — %s", error, msg)
+
+    # ── Salud de la conexión ──────────────────────────────────────────────────
+
+    def is_stale(self, threshold_s: int = 60) -> bool:
+        """True si no se recibió ningún callback de datos en los últimos threshold_s segundos.
+
+        Con interval=15s, umbral=60s significa que el WS lleva al menos 4 ciclos sin
+        actualizar — señal clara de desconexión silenciosa.
+        """
+        if self._last_update == 0.0:
+            return False   # nunca recibió datos aún (startup normal)
+        return (time.time() - self._last_update) > threshold_s
+
+    def reconnect(self) -> None:
+        """Desconecta y reconecta al broker. Silencia excepciones — el caller decide."""
+        logger.warning("Reconectando a Bull Market (datos stale)...")
+        try:
+            self.disconnect()
+        except Exception as exc:
+            logger.debug("Error al desconectar antes de reconexión: %s", exc)
+        try:
+            self.connect()
+            logger.info("Reconexión exitosa.")
+        except Exception as exc:
+            logger.error("Reconexión fallida: %s", exc)
+            self._connected = False
 
     # ── Interfaz pública ──────────────────────────────────────────────────────
 
