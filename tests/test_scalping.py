@@ -3,9 +3,12 @@ from datetime import datetime, timedelta, date
 from optionsdesk.core.greeks_engine import OptionGreeks
 from optionsdesk.data.providers.base import OptionsChain, Quote
 from optionsdesk.signals.scalping import (
+    LivePulse,
     ScalpSignal,
     _finalize_signal,
     _signal_rank,
+    build_scalp_verdict,
+    compute_spot_tape_pulse,
     scan_all,
     scan_chain_iv_relative,
     scan_gamma_radar,
@@ -429,6 +432,73 @@ def test_signal_rank_prioritizes_highest_viable_pop():
     assert ranked[0].symbol == "HIGHPOP"
 
 
+def test_spot_tape_pulse_requires_enough_live_observations_and_span():
+    start = datetime(2026, 6, 1, 12, 0)
+    short = [(start + timedelta(seconds=i * 10), 4000.0 + i * 2.0) for i in range(4)]
+    ready = [(start + timedelta(seconds=i * 20), 4000.0 + i * 2.0) for i in range(5)]
+
+    assert not compute_spot_tape_pulse(short).confirmed
+    pulse = compute_spot_tape_pulse(ready)
+    assert pulse.confirmed
+    assert pulse.direction == "BULL"
+    assert pulse.observations == 5
+
+
+def test_verdict_waits_without_confirmed_live_pulse():
+    sig = _rank_sig("READY", pop=0.68, ev=300.0)
+    verdict = build_scalp_verdict(
+        [sig],
+        feed_live=True,
+        capital=1_000_000.0,
+        pulse=LivePulse(False),
+        session_phase="regular",
+    )
+
+    assert verdict.decision == "WAIT"
+    assert "sin_confirmacion_intradia_live" in verdict.blockers
+
+
+def test_verdict_selects_highest_pop_viable_buy():
+    low = _rank_sig("LOW", pop=0.55, ev=900.0)
+    high = _rank_sig("HIGH", pop=0.68, ev=300.0)
+    verdict = build_scalp_verdict(
+        [low, high],
+        feed_live=True,
+        capital=1_000_000.0,
+        pulse=LivePulse(True, direction="BULL", observations=5, span_s=80.0),
+        session_phase="regular",
+    )
+
+    assert verdict.decision == "BUY_CALL_NOW"
+    assert verdict.signal is high
+
+
+def test_scan_all_overnight_is_explicit_opt_in(monkeypatch):
+    import optionsdesk.signals.scalping as scalping
+
+    calls = []
+    original = scalping._overnight_overrides
+    monkeypatch.setattr(scalping, "_current_session_phase", lambda eod_window_min=35: "close")
+    monkeypatch.setattr(
+        scalping,
+        "_overnight_overrides",
+        lambda cfg: calls.append(True) or original(cfg),
+    )
+    spot_quote = Quote("GGAL", 4000.0, 4000.0, 4000.0, 1000, datetime.now())
+    chain = OptionsChain(
+        "GGAL",
+        spot_quote,
+        {"GFGC4000A": Quote("GFGC4000A", 150.0, 160.0, 155.0, 100, datetime.now())},
+    )
+    expiry_calendar = {"A": date.today() + timedelta(days=20)}
+
+    scan_all(chain, expiry_calendar, capital=1_000_000.0)
+    assert calls == []
+
+    scan_all(chain, expiry_calendar, capital=1_000_000.0, allow_overnight_entries=True)
+    assert calls == [True]
+
+
 def test_soft_score_flag_does_not_block_actionable_signal(mock_greeks, monkeypatch):
     def fake_plan(*args, **kwargs):
         return {
@@ -447,7 +517,7 @@ def test_soft_score_flag_does_not_block_actionable_signal(mock_greeks, monkeypat
         }
 
     monkeypatch.setattr("optionsdesk.signals.scalping._trade_plan_detail", fake_plan)
-    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args: 0.70)
+    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args, **kwargs: 0.70)
     g = mock_greeks["GFGC4000A"]
     sig = _rank_sig("GFGC4000A", pop=0.70, ev=0.0)
     sig.score = 20.0
@@ -477,7 +547,7 @@ def test_negative_ev_blocks_even_with_high_pop(mock_greeks, monkeypatch):
         }
 
     monkeypatch.setattr("optionsdesk.signals.scalping._trade_plan_detail", fake_plan)
-    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args: 0.99)
+    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args, **kwargs: 0.99)
     g = mock_greeks["GFGC4000A"]
     sig = _rank_sig("GFGC4000A", pop=0.99, ev=0.0)
 
@@ -505,7 +575,7 @@ def test_extreme_spread_is_hard_block(mock_greeks, monkeypatch):
         }
 
     monkeypatch.setattr("optionsdesk.signals.scalping._trade_plan_detail", fake_plan)
-    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args: 0.70)
+    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args, **kwargs: 0.70)
     g = mock_greeks["GFGC4000A"]
     g.spread_pct = 40.0
     sig = _rank_sig("GFGC4000A", pop=0.70, ev=0.0)

@@ -73,11 +73,6 @@ class Settings:
         default_factory=lambda: _env_float("DEFAULT_CAUCION_TNA", 45.0) or 45.0
     )
 
-    # Market schedule
-    market_tz: str = "America/Argentina/Buenos_Aires"
-    market_open: str = "10:30"
-    market_close: str = "17:00"
-
     # Recorder snapshot interval (seconds). Default 15s: pyhomebroker usa WebSocket
     # streaming, los datos llegan en segundos. 120s era excesivamente conservador.
     recorder_interval_s: int = field(
@@ -153,23 +148,16 @@ class Settings:
     scalping_max_total_risk_pct: float = field(
         default_factory=lambda: _env_float("SCALPING_MAX_TOTAL_RISK_PCT", 4.0) or 4.0
     )
-    scalping_daily_loss_pct: float = field(
-        default_factory=lambda: _env_float("SCALPING_DAILY_LOSS_PCT", 2.0) or 2.0
-    )
-    scalping_max_trades_per_day: int = field(
-        default_factory=lambda: _env_int("SCALPING_MAX_TRADES_PER_DAY", 5)
-    )
-    scalping_cooldown_after_losses: int = field(
-        default_factory=lambda: _env_int("SCALPING_COOLDOWN_AFTER_LOSSES", 2)
-    )
-    scalping_max_hold_min: int = field(
-        default_factory=lambda: _env_int("SCALPING_MAX_HOLD_MIN", 90)
-    )
     scalping_no_progress_min: int = field(
         default_factory=lambda: _env_int("SCALPING_NO_PROGRESS_MIN", 20)
     )
     scalping_flat_before_close_min: int = field(
         default_factory=lambda: _env_int("SCALPING_FLAT_BEFORE_CLOSE_MIN", 10)
+    )
+    # Ventana antes del cierre para evaluar overnight solo cuando el operador
+    # lo habilita explicitamente: DTE>=5, filtros estrictos y sizing reducido.
+    scalping_eod_window_min: int = field(
+        default_factory=lambda: _env_int("SCALPING_EOD_WINDOW_MIN", 35)
     )
 
     def is_iol_configured(self) -> bool:

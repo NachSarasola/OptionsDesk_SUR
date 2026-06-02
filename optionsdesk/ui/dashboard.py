@@ -1,4 +1,4 @@
-"""Tablero Streamlit de análisis de opciones GGAL — v2 "for dummies".
+"""Tablero Streamlit profesional para análisis de opciones GGAL.
 
 Ejecutar con:
     streamlit run optionsdesk/ui/dashboard.py
@@ -8,8 +8,9 @@ Modo avanzado: desbloquea Cadena completa, Simulador P&L e Historial.
 """
 from __future__ import annotations
 
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -19,8 +20,14 @@ import pandas as pd
 import streamlit as st
 
 from optionsdesk.config.settings import settings
+from optionsdesk.config.costs import DEFAULT_COSTS
 from optionsdesk.core.benchmark import Benchmark, ZERO_BENCHMARK
 from optionsdesk.core.rates import RateResult
+from optionsdesk.data.history import (
+    daily_with_live_spot as _daily_with_live_spot,
+    tape_ohlc as _tape_ohlc,
+    weekly_from_daily as _weekly_from_daily,
+)
 from optionsdesk.data.providers.base import MarketDataProvider, OptionsChain
 from optionsdesk.data.providers.demo import DemoProvider
 from optionsdesk.execution.base import Order, OrderSide
@@ -61,9 +68,7 @@ _CSS = """
   --border:     rgba(255,255,255,0.08);
   --border-h:   rgba(255,255,255,0.15);
   --card:       rgba(26,26,36,0.60);
-  --glow-sm:    0 0 20px rgba(245,158,11,0.15);
-  --glow-md:    0 0 40px rgba(245,158,11,0.20);
-  --glow-lg:    0 0 60px rgba(245,158,11,0.25);
+  --glow-sm:    0 0 12px rgba(245,158,11,0.10);
 }
 
 /* ── Base ─────────────────────────────────────────────────────────── */
@@ -72,32 +77,13 @@ html, body, .stApp {
   font-family: 'Inter', system-ui, sans-serif !important;
   color: var(--fg) !important;
 }
-
-/* Ambient orbs decorativos */
-.stApp::before {
-  content: '';
-  position: fixed;
-  top: -200px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 600px;
-  height: 600px;
-  background: radial-gradient(ellipse, rgba(245,158,11,0.04) 0%, transparent 70%);
-  filter: blur(60px);
-  pointer-events: none;
-  z-index: 0;
+[data-testid="stMainBlockContainer"] {
+  max-width: 1500px !important;
+  padding-top: 1.25rem !important;
+  padding-bottom: 2rem !important;
 }
-.stApp::after {
-  content: '';
-  position: fixed;
-  bottom: -200px;
-  right: -100px;
-  width: 500px;
-  height: 500px;
-  background: radial-gradient(ellipse, rgba(245,158,11,0.03) 0%, transparent 70%);
-  filter: blur(80px);
-  pointer-events: none;
-  z-index: 0;
+[data-testid="stMainBlockContainer"] [data-testid="stVerticalBlock"] {
+  gap: 0.75rem !important;
 }
 
 /* ── Tipografía ───────────────────────────────────────────────────── */
@@ -105,7 +91,7 @@ h1, h2, h3, h4, h5, h6,
 .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   font-family: 'Space Grotesk', system-ui, sans-serif !important;
   font-weight: 600 !important;
-  letter-spacing: -0.025em !important;
+  letter-spacing: 0 !important;
   color: var(--fg) !important;
 }
 .stMarkdown p, .stMarkdown li { font-family: 'Inter', sans-serif !important; }
@@ -136,29 +122,23 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 .stApp [data-testid="stMarkdownContainer"] h1 {
   font-size: 1.75rem;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--fg) 60%, var(--accent));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--fg) !important;
 }
 
 /* ── Métricas ─────────────────────────────────────────────────────── */
 [data-testid="metric-container"] {
   background: var(--card) !important;
-  backdrop-filter: blur(8px) !important;
   border: 1px solid var(--border) !important;
-  border-radius: 12px !important;
-  padding: 1rem 1.25rem !important;
-  transition: all 300ms ease-out !important;
+  border-radius: 8px !important;
+  padding: 0.78rem 0.95rem !important;
 }
 [data-testid="metric-container"]:hover {
   border-color: var(--border-h) !important;
-  box-shadow: var(--glow-sm) !important;
 }
 [data-testid="metric-container"] [data-testid="stMetricLabel"] {
   font-family: 'JetBrains Mono', monospace !important;
   font-size: 0.75rem !important;
-  letter-spacing: 0.05em !important;
+  letter-spacing: 0 !important;
   color: var(--fg-muted) !important;
   text-transform: uppercase !important;
 }
@@ -176,7 +156,7 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 /* ── Tabs ─────────────────────────────────────────────────────────── */
 [data-testid="stTabs"] [role="tablist"] {
   background: var(--bg-alt) !important;
-  border-radius: 10px !important;
+  border-radius: 8px !important;
   padding: 4px !important;
   border: 1px solid var(--border) !important;
   gap: 2px !important;
@@ -188,7 +168,6 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
   color: var(--fg-muted) !important;
   border-radius: 7px !important;
   padding: 6px 16px !important;
-  transition: all 200ms ease-out !important;
   border: none !important;
   background: transparent !important;
 }
@@ -196,7 +175,6 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
   background: var(--bg-muted) !important;
   color: var(--fg) !important;
   border-color: var(--border) !important;
-  box-shadow: var(--glow-sm) !important;
 }
 [data-testid="stTabs"] [role="tab"]:hover:not([aria-selected="true"]) {
   color: var(--fg) !important;
@@ -207,8 +185,7 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 .stButton button {
   font-family: 'Inter', sans-serif !important;
   font-weight: 500 !important;
-  border-radius: 10px !important;
-  transition: all 200ms ease-out !important;
+  border-radius: 8px !important;
   border: 1px solid var(--border) !important;
   background: rgba(26,26,36,0.6) !important;
   color: var(--fg) !important;
@@ -216,11 +193,9 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 .stButton button:hover {
   border-color: var(--accent) !important;
   color: var(--accent) !important;
-  box-shadow: var(--glow-sm) !important;
-  transform: scale(1.01) !important;
 }
 .stButton button:active {
-  transform: scale(0.98) !important;
+  opacity: 0.92 !important;
 }
 /* Botón primario (el primero en cada grupo suele ser el CTA) */
 .stButton [kind="primary"] button,
@@ -228,25 +203,20 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
   background: var(--accent) !important;
   color: #0A0A0F !important;
   border: none !important;
-  box-shadow: var(--glow-sm) !important;
 }
 .stButton [kind="primary"] button:hover {
   filter: brightness(1.1) !important;
-  box-shadow: 0 0 20px rgba(245,158,11,0.4) !important;
   color: #0A0A0F !important;
 }
 
 /* ── Containers con borde (st.container(border=True)) ─────────────── */
 [data-testid="stVerticalBlockBorderWrapper"] {
   background: var(--card) !important;
-  backdrop-filter: blur(8px) !important;
   border: 1px solid var(--border) !important;
-  border-radius: 12px !important;
-  transition: all 300ms ease-out !important;
+  border-radius: 8px !important;
 }
 [data-testid="stVerticalBlockBorderWrapper"]:hover {
   border-color: var(--border-h) !important;
-  box-shadow: var(--glow-sm) !important;
 }
 
 /* ── Inputs / Selectbox / Slider ──────────────────────────────────── */
@@ -254,7 +224,6 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 [data-testid="stTextInput"] input,
 [data-testid="stNumberInput"] input {
   background: var(--card) !important;
-  backdrop-filter: blur(8px) !important;
   border: 1px solid var(--border) !important;
   border-radius: 8px !important;
   color: var(--fg) !important;
@@ -283,9 +252,8 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 
 /* ── Alerts (info, warning, error, success) ───────────────────────── */
 [data-testid="stAlert"] {
-  border-radius: 10px !important;
+  border-radius: 8px !important;
   border-left-width: 3px !important;
-  backdrop-filter: blur(8px) !important;
 }
 [data-testid="stAlert"][data-baseweb="notification"][kind="info"] {
   background: rgba(245,158,11,0.08) !important;
@@ -308,9 +276,7 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 [data-testid="stExpander"] {
   background: var(--card) !important;
   border: 1px solid var(--border) !important;
-  border-radius: 10px !important;
-  backdrop-filter: blur(8px) !important;
-  transition: all 200ms ease-out !important;
+  border-radius: 8px !important;
 }
 [data-testid="stExpander"]:hover {
   border-color: var(--border-h) !important;
@@ -324,11 +290,11 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
 /* ── Dataframes / Tablas ──────────────────────────────────────────── */
 [data-testid="stDataFrame"] {
   border: 1px solid var(--border) !important;
-  border-radius: 10px !important;
+  border-radius: 8px !important;
   overflow: hidden !important;
 }
 [data-testid="stDataFrame"] iframe {
-  border-radius: 10px !important;
+  border-radius: 8px !important;
 }
 
 /* ── Captions / Labels ────────────────────────────────────────────── */
@@ -337,13 +303,13 @@ code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
   font-family: 'JetBrains Mono', monospace !important;
   font-size: 0.75rem !important;
   color: var(--fg-muted) !important;
-  letter-spacing: 0.02em !important;
+  letter-spacing: 0 !important;
 }
 
 /* ── Divider ──────────────────────────────────────────────────────── */
 hr {
   border-color: var(--border) !important;
-  margin: 1.5rem 0 !important;
+  margin: 1rem 0 !important;
 }
 
 /* ── Scrollbar ────────────────────────────────────────────────────── */
@@ -425,25 +391,31 @@ def _get_paper_executor() -> PaperExecutor:
     return PaperExecutor()
 
 
+def _effective_expiry_calendar(chain: Optional[OptionsChain], fallback: Optional[dict] = None) -> dict:
+    from optionsdesk.core.instruments import merge_expiry_calendars
+
+    return merge_expiry_calendars(fallback, getattr(chain, "expiry_calendar", None))
+
+
 # ── Helpers de datos ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
-def _load_spot_history(days: int = 180) -> Optional[pd.DataFrame]:
+def _load_spot_history(days: int = 180, allow_synthetic: bool = True) -> Optional[pd.DataFrame]:
     """Historial OHLCV de GGAL vía PyOBD (con cache local y fallback sintético)."""
     try:
         from optionsdesk.data.history import UnderlyingHistory
-        df = UnderlyingHistory().daily("GGAL", days=days)
+        df = UnderlyingHistory().daily("GGAL", days=days, allow_synthetic=allow_synthetic)
         return df if not df.empty else None
     except Exception:
         return None
 
 
 @st.cache_data(ttl=3600)
-def _load_htf_history(weeks: int = 52) -> Optional[pd.DataFrame]:
+def _load_htf_history(weeks: int = 52, allow_synthetic: bool = True) -> Optional[pd.DataFrame]:
     """Historial semanal (HTF) de GGAL — resampleado desde daily."""
     try:
         from optionsdesk.data.history import UnderlyingHistory
-        df = UnderlyingHistory().weekly("GGAL", weeks=weeks)
+        df = UnderlyingHistory().weekly("GGAL", weeks=weeks, allow_synthetic=allow_synthetic)
         return df if not df.empty else None
     except Exception:
         return None
@@ -978,7 +950,7 @@ def _tab_opportunities(
         alerter.send_top_opportunities(cc_filtered[:3])
 
 
-# ── Tab: Aprende ──────────────────────────────────────────────────────────────
+# ── Tab: Referencia ───────────────────────────────────────────────────────────
 
 def _tab_learn() -> None:
     guide_path = Path("GUIA.md")
@@ -1328,18 +1300,17 @@ def _tab_directional(
 
 
 # ── Tab: Historial ────────────────────────────────────────────────────────────
-def _close_position_live(symbol: str, strategy: str, lotes: int, provider) -> None:
-    is_buy = "SHORT" in strategy
-    success = provider.send_order(symbol, is_buy, lotes, 0.0) # Using 0.0 for now, should pull quote for limit order
-    if success:
-        st.success(f"Orden de cierre enviada para {lotes} lotes de {symbol}")
+def _close_position_manual(index: int, monitor) -> None:
+    if monitor.remove_position_at(index):
+        st.success("Posicion marcada como cerrada en el registro local.")
     else:
-        st.error(f"Error al enviar orden de cierre para {symbol}")
+        st.error("No se pudo actualizar el registro local.")
 
 def _tab_portfolio(provider, chain, spot):
     st.subheader("Portfolio Activo (Scalping)")
     try:
         from optionsdesk.signals.monitor import PositionMonitor
+        from optionsdesk.signals.management import evaluate_scalp_quote_position
         monitor = PositionMonitor(settings.open_positions_file)
         positions = monitor.load_positions()
     except Exception:
@@ -1352,22 +1323,40 @@ def _tab_portfolio(provider, chain, spot):
     rows = []
     for p in positions:
         quote = chain.options.get(p.symbol) if chain else None
-        mid = quote.mid if quote else p.spot_entry
-        pnl_gross = (mid - p.net_outlay) * p.contracts * 100 if "LONG" in p.strategy else (p.net_outlay - mid) * p.contracts * 100
-        # Comisiones IOL aprox 0.5% + IVA
-        commissions = (p.net_outlay * p.contracts * 100 * 0.005 * 1.21) + (mid * p.contracts * 100 * 0.005 * 1.21)
-        pnl_net = pnl_gross - commissions
-        pnl_pct = (pnl_net / (p.net_outlay * p.contracts * 100)) * 100 if p.net_outlay > 0 else 0.0
-        
+        strategy = str(p.strategy).upper()
+        is_long = "LONG" in strategy
+        entry = float(p.scalp_plan_entry or (p.net_outlay if is_long else p.premium_received) or 0.0)
+        mark = (quote.bid if is_long else quote.ask) if quote else None
+        if mark is not None and entry > 0:
+            pnl_gross = ((mark - entry) if is_long else (entry - mark)) * p.contracts * 100
+            entry_side = "option_buy" if is_long else "option_sell"
+            exit_side = "option_sell" if is_long else "option_buy"
+            commissions = (
+                DEFAULT_COSTS.gross_cost(entry * p.contracts * 100, entry_side)
+                + DEFAULT_COSTS.gross_cost(mark * p.contracts * 100, exit_side)
+            )
+            pnl_net = pnl_gross - commissions
+            risk_basis = max(float(p.net_outlay or entry), 0.01) * p.contracts * 100
+            pnl_pct = pnl_net / risk_basis * 100.0
+        else:
+            commissions = pnl_net = pnl_pct = None
+
+        status = "SIN_QUOTE"
+        if "SCALP" in strategy and mark is not None:
+            status = evaluate_scalp_quote_position(p, mark).signal_type.value
+
         rows.append({
             "Símbolo": p.symbol,
             "Estrategia": p.strategy,
             "Lotes": p.contracts,
-            "Entrada": _scalp_money(p.net_outlay, 2),
-            "Mark (Mid)": _scalp_money(mid, 2),
+            "Entrada": _scalp_money(entry, 2),
+            "Salida ejecutable": _scalp_money(mark, 2),
+            "SL": _scalp_money(p.scalp_plan_sl, 2),
+            "TP": _scalp_money(p.scalp_plan_tp, 2),
+            "Estado": status,
             "Comisiones": _scalp_money(commissions, 2),
             "PnL Neto": _scalp_money(pnl_net, 2),
-            "PnL %": f"{pnl_pct:+.2f}%",
+            "PnL %": _scalp_pct(pnl_pct, 2, signed=True),
         })
 
     import pandas as pd
@@ -1375,16 +1364,17 @@ def _tab_portfolio(provider, chain, spot):
     st.dataframe(df, hide_index=True, use_container_width=True)
 
     st.markdown("### Acciones Rápidas")
+    st.caption("Cerra primero en tu broker con orden limite; despues marca la posicion cerrada aca.")
     cols = st.columns(min(4, len(positions)))
     for i, p in enumerate(positions[:4]):
         with cols[i]:
             st.markdown(f"**{p.symbol}**")
-            if st.button("Cerrar Posición", key=f"close_{p.symbol}_{i}", type="secondary"):
-                _close_position_live(p.symbol, p.strategy, p.contracts, provider)
+            if st.button("Marcar cerrada", key=f"close_{p.symbol}_{i}", type="secondary"):
+                _close_position_manual(i, monitor)
                 st.rerun()
 
 def _tab_history() -> None:
-    snapshots_dir = Path("data/snapshots")
+    snapshots_dir = settings.snapshots_dir
     if not snapshots_dir.exists() or not any(snapshots_dir.iterdir()):
         st.info(
             "No hay historial grabado. "
@@ -1436,7 +1426,7 @@ def _scalp_card(label: str, value: str, tag: str, color: str) -> str:
         f"<div style='background:rgba(26,26,36,0.85);border:1px solid {color}33;"
         f"border-radius:8px;padding:10px 12px;min-height:88px;'>"
         f"<div style='font-size:0.62rem;color:#71717A;text-transform:uppercase;"
-        f"letter-spacing:.07em;margin-bottom:4px;font-family:JetBrains Mono,monospace;'>{label}</div>"
+        f"letter-spacing:0;margin-bottom:4px;font-family:JetBrains Mono,monospace;'>{label}</div>"
         f"<div style='font-size:1.2rem;font-weight:700;color:#FAFAFA;line-height:1.15;'>{value}</div>"
         f"<div style='font-size:0.72rem;color:{color};font-weight:600;margin-top:5px;'>{tag}</div>"
         f"</div>"
@@ -1451,15 +1441,105 @@ def _signal_color(sig) -> str:
     return "#f59e0b"
 
 
-def _execute_scalp_trade_live(sig, spot: float, lotes: int, tna: float, provider) -> None:
-    is_buy = sig.action.startswith("BUY")
-    price = sig.ask if is_buy else sig.bid
-    success = provider.send_order(sig.symbol, is_buy, lotes, price)
-    if not success:
-        st.error(f"Fallo al enviar la orden real a IOL para {sig.symbol}. Verifica logs.")
-        return
-    # Si la orden se envío bien, la registramos localmente en el monitor
-    _simulate_scalp_trade(sig, spot, lotes, tna)
+def _scalp_flag_label(flag: str) -> str:
+    """Traduce codigos estables del motor a lenguaje de mesa."""
+    exact = {
+        "feed_no_live": "Feed live IOL no disponible",
+        "capital_no_cargado": "Capital no cargado para calcular lotes",
+        "capital_insuficiente": "Capital insuficiente para abrir un lote",
+        "fuera_horario_byma": "Fuera del horario operativo BYMA",
+        "cierre_intradia": "No abrir un scalp intradia cerca del cierre",
+        "apertura_cierre_byma": "Ventana de apertura o cierre: esperar mejor microestructura",
+        "sin_confirmacion_intradia_live": "GGAL aun no confirma momentum intradia en el feed live",
+        "pulso_live_no_alcista": "El pulso live de GGAL no confirma una entrada alcista",
+        "pulso_live_no_bajista": "El pulso live de GGAL no confirma una entrada bajista",
+        "sin_setup_viable": "No hay un setup con PoP, EV y ejecucion suficientes",
+        "quote_stale": "Cotizacion desactualizada",
+        "spread_alto": "Spread superior al rango preferido",
+        "delta_baja": "Delta insuficiente para responder al movimiento",
+        "strike_lejano": "Strike demasiado alejado del spot",
+        "ev_no_positivo": "EV neto no positivo despues de costos",
+        "stop_dentro_spread": "El stop queda absorbido por el spread",
+        "costo_alto_vs_atr": "Costo de entrada alto frente al ATR",
+        "riesgo_total_scalping_agotado": "Riesgo total de scalping agotado",
+        "falta_contexto_direccional": "Falta contexto direccional",
+        "sin_trigger_direccional": "Todavia no hay trigger direccional",
+        "sesgo_no_alcista": "El contexto no confirma calls",
+        "sesgo_no_bajista": "El contexto no confirma puts",
+        "falta_vol_realizada": "Falta volatilidad realizada para validar el edge",
+        "ola_sin_confirmacion": "La ola necesita confirmacion adicional",
+        "rsi_extendido": "RSI extendido: evitar perseguir precio",
+        "rebote_sin_choch": "Rebote sin cambio de estructura confirmado",
+        "rebote_contra_tendencia": "Rebote contra la tendencia dominante",
+        "esperando_breakout_direccion": "Breakout sin direccion confirmada",
+        "voladura_sin_confirmar": "Expansion de volatilidad aun no confirmada",
+        "sin_edge_vol_confirmado": "Edge de volatilidad aun no confirmado",
+        "esperando_trigger_scalping": "Esperando trigger de entrada",
+        "iv_barata_no_direccional": "IV atractiva, pero sin direccion confirmada",
+        "confirmar_breakout": "Breakout pendiente de confirmacion",
+        "venta_iv_solo_contexto": "Venta de IV solo informativa para este scanner",
+        "short_call_no_cubierto": "Call short sin cobertura",
+        "short_put_no_cash_secured": "Put short sin efectivo reservado",
+        "no_tradeable": "Contrato no operable con las puntas actuales",
+        "setup_overnight": "Entrada overnight habilitada explicitamente",
+    }
+    if flag in exact:
+        return exact[flag]
+    prefixes = {
+        "rr<": "R:R por debajo del minimo: ",
+        "pop<": "PoP por debajo del minimo: ",
+        "score<": "Score por debajo del minimo: ",
+        "be_move>": "Movimiento de equilibrio demasiado exigente: ",
+        "spread_extremo>": "Spread extremo: ",
+        "overnight_dte<": "DTE insuficiente para overnight: ",
+        "max_scalps_abiertos>=": "Maximo de scalps abiertos alcanzado: ",
+        "quote stale": "Cotizacion desactualizada: ",
+    }
+    for prefix, label in prefixes.items():
+        if flag.startswith(prefix):
+            return label + flag[len(prefix):]
+    return flag.replace("_", " ")
+
+
+def _scalp_flags_text(flags: list[str]) -> str:
+    return ", ".join(_scalp_flag_label(flag) for flag in flags)
+
+
+def _scalp_wait_message(verdict) -> str:
+    blockers = list(getattr(verdict, "blockers", []) or [])
+    pulse = getattr(verdict, "pulse", None)
+    if "sin_confirmacion_intradia_live" in blockers and pulse is not None:
+        if pulse.observations < 5 or pulse.span_s < 60:
+            return (
+                "ESPERAR: formando pulso live de GGAL "
+                f"({pulse.observations}/5 observaciones, {pulse.span_s:.0f}/60 s)."
+            )
+        return (
+            "ESPERAR: GGAL sigue neutral en el tape live; "
+            "todavia no confirma direccion para call ni put."
+        )
+    return "ESPERAR: " + _scalp_flags_text(blockers or [getattr(verdict, "reason", "")])
+
+
+def _spot_tape_pulse(spot: float, provider_key: str):
+    """Acumula observaciones IOL de la sesion para confirmar momentum real."""
+    from optionsdesk.signals.scalping import compute_spot_tape_pulse
+
+    now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    tape_key = f"{provider_key}:{now.date().isoformat()}"
+    if st.session_state.get("scalp_spot_tape_key") != tape_key:
+        st.session_state["scalp_spot_tape_key"] = tape_key
+        st.session_state["scalp_spot_tape"] = []
+
+    tape = list(st.session_state.get("scalp_spot_tape", []))
+    if spot > 0 and (not tape or (now - tape[-1][0]).total_seconds() >= 5):
+        tape.append((now, float(spot)))
+    cutoff = now - timedelta(hours=3)
+    tape = [(ts, px) for ts, px in tape if ts >= cutoff]
+    st.session_state["scalp_spot_tape"] = tape
+    pulse_cutoff = now - timedelta(minutes=10)
+    return compute_spot_tape_pulse([(ts, px) for ts, px in tape if ts >= pulse_cutoff])
+
 
 def _simulate_scalp_trade(sig, spot: float, lotes: int, tna: float) -> None:
     import json
@@ -1489,6 +1569,7 @@ def _simulate_scalp_trade(sig, spot: float, lotes: int, tna: float) -> None:
         "iv_entry": sig.iv or 0.0,
         "days_entry": max(int(sig.days_to_expiry), 1),
         "entry_date": date.today().isoformat(),
+        "opened_at": datetime.now().isoformat(timespec="seconds"),
         "target_exit_days": max(min(int(sig.days_to_expiry), 2), 1),
         "target_capture_pct": max(min(target_pct, 80.0), 15.0),
         "caucion_tna": tna,
@@ -1506,6 +1587,7 @@ def _simulate_scalp_trade(sig, spot: float, lotes: int, tna: float) -> None:
         "scalp_fill_probability": getattr(sig, "fill_probability", 0.0),
         "scalp_cost_to_target_pct": getattr(sig, "cost_to_target_pct", 0.0),
         "scalp_time_stop_min": getattr(sig, "time_stop_min", 20),
+        "scalp_allow_overnight": "setup_overnight" in getattr(sig, "risk_flags", []),
     }
     with file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(pos, ensure_ascii=False) + "\n")
@@ -1523,37 +1605,51 @@ def _tab_scalping(
     caucion_tna: float,
     ltf_df: Optional[pd.DataFrame] = None,
 ) -> None:
-    from optionsdesk.signals.scalping import scan_all
-
-    try:
-        from optionsdesk.signals.monitor import PositionMonitor
-        positions = PositionMonitor(settings.open_positions_file).load_positions()
-    except Exception:
-        positions = []
+    from optionsdesk.signals.scalping import build_scalp_verdict, scan_all
 
     st.subheader("Scalping & Momentum")
-    st.caption("Mesa de scalping intradía. El botón EJECUTAR EN MERCADO envía orden real a IOL.")
+    st.caption("Mesa intradia con ejecucion manual. Opera en tu broker con orden limite y registra el fill confirmado.")
 
-    ctl_cap, ctl_refresh = st.columns([3, 1])
+    # ── Controles estables (fuera del fragment, no parpadean) ─────────────────
+    ctl_cap, ctl_iv, ctl_refresh = st.columns([3, 1, 1])
     with ctl_cap:
         capital_default = int(st.session_state.get("scalp_capital", capital or settings.default_capital or 0) or 0)
         capital_input = st.number_input(
             "Capital máximo para scalping (ARS)",
-            min_value=0,
-            max_value=100_000_000,
-            value=capital_default,
-            step=50_000,
-            help="Este capital define sizing, riesgo por trade y bloqueo de señales reales.",
+            min_value=0, max_value=100_000_000, value=capital_default, step=50_000,
+            help="Define sizing, riesgo por trade y bloqueo de señales.",
             key="capital_scalping_main",
         )
-        capital = float(capital_input) if capital_input > 0 else None
+        capital_live = float(capital_input) if capital_input > 0 else None
         st.session_state["scalp_capital"] = float(capital_input or 0)
+    with ctl_iv:
+        interval_opts = {"15s": 15, "30s": 30, "1min": 60, "2min": 120, "Pausa": None}
+        interval_label = st.selectbox(
+            "Auto-refresh", list(interval_opts.keys()), index=1,
+            help="Solo actualiza el panel de señales y el gráfico — el resto de la app no se toca.",
+            key="scalp_refresh_interval",
+        )
+        interval_s = interval_opts[interval_label]
     with ctl_refresh:
         st.write("")
-        if st.button("Actualizar datos", key="btn_refresh_scalping", use_container_width=True):
+        if st.button("Forzar ahora", key="btn_refresh_scalping", use_container_width=True):
             st.session_state["force_refresh"] = True
             st.rerun()
+    allow_overnight_entries = st.toggle(
+        "Evaluar entrada overnight",
+        value=False,
+        help="Activalo solo para buscar una posicion nueva que deliberadamente se mantendra al dia siguiente.",
+        key="scalp_allow_overnight_entries",
+    )
+    chart_timeframe = st.segmented_control(
+        "Velas",
+        ["Tape 1m", "Tape 5m", "Diario", "Semanal"],
+        default="Tape 1m",
+        key="scalp_chart_timeframe",
+        help="Tape usa observaciones spot IOL desde que abriste el panel. Diario y semanal incluyen la cotizacion live actual.",
+    )
 
+    # RV diaria: se calcula una vez por carga de página (historial daily, no cambia en minutos)
     realized_vol = None
     if spot_history_df is not None and not spot_history_df.empty:
         try:
@@ -1564,247 +1660,329 @@ def _tab_scalping(
         except Exception:
             realized_vol = None
 
-    snap = None
-    if context is not None:
-        snap = getattr(context, "ltf_snap", None) or getattr(context, "snap", None)
+    # ── Panel en vivo: se auto-actualiza sin tocar el resto de la app ─────────
+    # st.fragment re-ejecuta SOLO este bloque en el intervalo indicado.
+    # La cadena se consulta en cada tick: no presentamos quotes cacheadas como si fueran vivas.
+    @st.fragment(run_every=interval_s)
+    def _live_panel() -> None:
+        # Datos frescos dentro del fragment
+        try:
+            from optionsdesk.signals.monitor import PositionMonitor
+            positions_now = PositionMonitor(settings.open_positions_file).load_positions()
+        except Exception:
+            positions_now = []
 
-    try:
-        greeks, signals = scan_all(
-            chain,
-            expiry_calendar,
-            snap=snap,
-            realized_vol=realized_vol,
-            r=0.0,
-            capital=capital,
-            positions=positions,
-            risk_profile=risk_profile,
+        # LTF con TTL=20s — cada tick del fragment obtiene barras frescas del cache
+        ltf_live = _load_ltf_history()
+
+        try:
+            chain_now: Optional[OptionsChain] = provider.get_options_chain()
+        except Exception as exc:
+            st.error(f"No se pudo actualizar la cadena: {exc}")
+            return
+        if chain_now is None:
+            st.warning("Sin cadena fresca de opciones. Espera el proximo tick o revisa el feed.")
+            return
+        st.session_state["chain"] = chain_now
+        live_expiry_calendar = _effective_expiry_calendar(chain_now, expiry_calendar)
+        health = provider.get_health()
+        spot_now = chain_now.spot.mid
+        live_pulse = _spot_tape_pulse(spot_now, st.session_state.get("provider_key", "unknown"))
+        tape_samples = list(st.session_state.get("scalp_spot_tape", []))
+        tape_1m = _tape_ohlc(tape_samples, "1min")
+
+        snap_now = None
+        live_bars = (
+            ltf_live if ltf_live is not None and not ltf_live.empty
+            else tape_1m if len(tape_1m) >= 20
+            else ltf_df
         )
-    except Exception as exc:
-        st.error(f"Scalping no pudo escanear la cadena: {exc}")
-        return
+        if live_bars is not None and not live_bars.empty:
+            try:
+                from optionsdesk.signals.technical import analyze
+                snap_now = analyze(live_bars)
+            except Exception:
+                snap_now = None
+        if snap_now is None and context is not None:
+            snap_now = getattr(context, "ltf_snap", None) or getattr(context, "snap", None)
 
-    actionables = [s for s in signals if s.confidence == "actionable"]
-    watchlist = [s for s in signals if s.confidence != "actionable"]
-    tradeable = [g for g in greeks.values() if g.is_tradeable]
-    health = provider.get_health()
+        try:
+            greeks, signals = scan_all(
+                chain_now, live_expiry_calendar,
+                snap=snap_now, realized_vol=realized_vol, r=0.0,
+                capital=capital_live, positions=positions_now, risk_profile=risk_profile,
+                allow_overnight_entries=allow_overnight_entries,
+                require_live_confirmation=True,
+                live_confirmation=live_pulse.confirmed and health.source == "IOL" and health.connected,
+                live_direction=live_pulse.direction,
+            )
+        except Exception as exc:
+            st.error(f"Scalping scan error: {exc}")
+            return
 
-    if not capital or capital <= 0:
-        actionables = []
+        actionables = [s for s in signals if s.confidence == "actionable"]
+        watchlist   = [s for s in signals if s.confidence != "actionable"]
+        tradeable   = [g for g in greeks.values() if g.is_tradeable]
 
-    h1, h2, h3, h4, h5, h6 = st.columns(6)
-    latency = f"{health.last_latency_ms:.0f} ms" if health.last_latency_ms is not None else "-"
+        if not capital_live or capital_live <= 0:
+            actionables = []
 
-    now_ba = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
-    session_end = now_ba.replace(hour=17, minute=0, second=0, microsecond=0)
-    mins_left = max((session_end - now_ba).total_seconds() / 60, 0)
-    session_color = "#22c55e" if mins_left > 30 else ("#f59e0b" if mins_left > 10 else "#ef4444")
-    session_phase = getattr(snap, "session_phase", None) if snap else None
-    if session_phase is None:
-        h = now_ba.hour + now_ba.minute / 60
-        session_phase = "cerrada" if (h < 11 or h >= 17) else ("apertura" if h < 11.33 else ("cierre" if h >= 16.75 else "regular"))
-
-    h1.markdown(_scalp_card("FEED", health.source, "conectado" if health.connected else "revisar", "#22c55e" if health.connected else "#ef4444"), unsafe_allow_html=True)
-    h2.markdown(_scalp_card("LATENCIA", latency, f"timeouts {health.timeouts}", "#22c55e" if not health.timeouts else "#f59e0b"), unsafe_allow_html=True)
-    h3.markdown(_scalp_card("CADENA", f"{len(tradeable)}/{len(greeks)}", "operable/parseada", "#22c55e" if tradeable else "#ef4444"), unsafe_allow_html=True)
-    h4.markdown(_scalp_card("SESIÓN", f"{int(mins_left)}m", session_phase, session_color), unsafe_allow_html=True)
-    h5.markdown(_scalp_card("RV 20D", f"{realized_vol * 100:.1f}%" if realized_vol else "-", "Yang-Zhang/close", "#71717a"), unsafe_allow_html=True)
-    h6.markdown(_scalp_card("ACCIONABLES", str(len(actionables)), f"watchlist {len(watchlist)}", "#22c55e" if actionables else "#71717a"), unsafe_allow_html=True)
-
-    preflight = []
-    if not settings.is_iol_configured() or health.source != "IOL":
-        preflight.append("No estás usando IOL como fuente primaria; tratá cualquier señal como radar.")
-    if capital is None or capital <= 0:
-        preflight.append("Cargá capital disponible para sizing real por riesgo.")
-    if snap is None:
-        preflight.append("Falta contexto intradiario: sin ola/rebote confirmado, las señales quedan degradadas.")
-    if realized_vol is None:
-        preflight.append("Falta volatilidad realizada: gamma scalp queda menos confiable.")
-    if health.timeouts:
-        preflight.append(f"El feed tuvo {health.timeouts} timeout(s). No operes si el dato se congela.")
-
-    if preflight:
-        st.warning("Pre-flight: " + " | ".join(preflight))
-    else:
-        st.success("Pre-flight OK: feed, contexto, volatilidad y sizing disponibles.")
-
-    # ── Gráfico de velas intradía con niveles de la señal ─────────────────────
-    intraday = ltf_df is not None and not ltf_df.empty
-    chart_df = ltf_df if intraday else spot_history_df
-    levels = [{"y": spot, "label": f"GGAL ${spot:,.0f}", "color": "#9ca3af", "dash": "dot"}]
-    chart_sig = None
-    if actionables:
-        labels = [
-            f"{s.action} {s.symbol} · PoP {s.probability_of_profit * 100:.0f}% · R:R {s.plan_rr:.1f}"
-            for s in actionables
-        ]
-        pick = st.selectbox(
-            "Señal sobre el gráfico",
-            range(len(actionables)),
-            format_func=lambda i: labels[i],
-            key="scalp_chart_pick",
+        # ── 6 cards de estado ─────────────────────────────────────────────────
+        h1, h2, h3, h4, h5, h6 = st.columns(6)
+        latency = f"{health.last_latency_ms:.0f} ms" if health.last_latency_ms is not None else "-"
+        now_ba = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+        session_end = now_ba.replace(hour=17, minute=0, second=0, microsecond=0)
+        h_val = now_ba.hour + now_ba.minute / 60
+        session_is_open = now_ba.weekday() < 5 and 11 <= h_val < 17
+        mins_left = max((session_end - now_ba).total_seconds() / 60, 0) if session_is_open else 0
+        session_color = "#22c55e" if mins_left > 30 else ("#f59e0b" if mins_left > 10 else "#ef4444")
+        session_phase = (
+            getattr(snap_now, "session_phase", None) or
+            ("cerrada" if (h_val < 11 or h_val >= 17)
+             else ("apertura" if h_val < 11.33 else ("cierre" if h_val >= 16.75 else "regular")))
         )
-        chart_sig = actionables[pick]
-        if chart_sig.underlying_target > 0:
-            levels.append({"y": chart_sig.underlying_target, "label": f"TP ${chart_sig.underlying_target:,.0f}", "color": "#26a69a", "dash": "dash"})
-        if chart_sig.underlying_stop > 0:
-            levels.append({"y": chart_sig.underlying_stop, "label": f"Stop ${chart_sig.underlying_stop:,.0f}", "color": "#ef5350", "dash": "dash"})
-
-    _candlestick_chart(
-        chart_df,
-        height=400,
-        smas={"SMA9": 9, "SMA20": 20},
-        levels=levels,
-        max_bars=120 if intraday else 60,
-    )
-    st.caption(
-        "Velas intradía GGAL con tu entrada/stop/TP proyectados sobre el subyacente."
-        if intraday else
-        "Sin intradía ahora (fuera de horario o sin feed): se muestra el diario."
-    )
-
-    if actionables:
-        best = actionables[0]
-        st.markdown("### Mejor trade por PoP viable")
-        st.success(
-            f"{best.action} {best.symbol} | PoP {best.probability_of_profit * 100:.0f}% | "
-            f"EV/lote {_scalp_money(best.expected_value_ars)} | "
-            f"Edge/R {getattr(best, 'edge_r', 0.0):+.2f} | "
-            f"Friccion/target {getattr(best, 'cost_to_target_pct', 0.0):.1f}%"
+        verdict = build_scalp_verdict(
+            signals,
+            feed_live=health.source == "IOL" and health.connected,
+            capital=capital_live,
+            pulse=live_pulse,
+            allow_overnight_entries=allow_overnight_entries,
+            session_phase=(
+                "closed" if not session_is_open
+                else "close" if mins_left <= settings.scalping_eod_window_min
+                else "open" if h_val < 11.33
+                else "regular"
+            ),
         )
-        st.caption(
-            "Seleccionado por: actionable > PoP > EV/riesgo > menor friccion > liquidez > score."
+        h1.markdown(_scalp_card("FEED", health.source, "conectado" if health.connected else "revisar", "#22c55e" if health.connected else "#ef4444"), unsafe_allow_html=True)
+        h2.markdown(_scalp_card("LATENCIA", latency, f"{health.timeouts} timeouts acumulados", "#22c55e" if not health.last_error else "#f59e0b"), unsafe_allow_html=True)
+        h3.markdown(_scalp_card("CADENA", f"{len(tradeable)}/{len(greeks)}", "operable/parseada", "#22c55e" if tradeable else "#ef4444"), unsafe_allow_html=True)
+        h4.markdown(_scalp_card("SESIÓN", f"{int(mins_left)}m", session_phase, session_color), unsafe_allow_html=True)
+        h5.markdown(_scalp_card("RV 20D", f"{realized_vol * 100:.1f}%" if realized_vol else "-", "Yang-Zhang/close", "#71717a"), unsafe_allow_html=True)
+        pulse_label = (
+            "ALCISTA" if live_pulse.confirmed and live_pulse.direction == "BULL"
+            else "BAJISTA" if live_pulse.confirmed and live_pulse.direction == "BEAR"
+            else "FORMANDO" if live_pulse.observations < 5 or live_pulse.span_s < 60
+            else "NEUTRAL"
         )
+        h6.markdown(_scalp_card("PULSO LIVE", pulse_label, f"{live_pulse.observations}/5 obs | {live_pulse.span_s:.0f}/60s", "#22c55e" if live_pulse.confirmed else "#f59e0b"), unsafe_allow_html=True)
 
-    st.markdown("### Señales accionables")
-    if not actionables:
-        st.info("No hay trades liberados ahora. Esto es deseable si el dato, el spread o el contexto no dan ventaja neta.")
-    else:
-        cols = st.columns(min(3, len(actionables)))
-        for i, sig in enumerate(actionables[:3]):
-            color = _signal_color(sig)
-            with cols[i]:
-                st.markdown(
-                    f"<div style='background:rgba(26,26,36,0.86);border-top:3px solid {color};"
-                    f"border-radius:8px;padding:12px;'>"
-                    f"<div style='font-size:0.72rem;color:#71717A;text-transform:uppercase;'>{sig.playbook} - {sig.confidence}</div>"
-                    f"<div style='font-size:1.2rem;font-weight:700;margin-top:2px;'>{sig.action} {sig.symbol}</div>"
-                    f"<div style='font-size:0.78rem;color:{color};font-weight:600;margin-top:4px;'>{sig.expected_move}</div>"
-                    f"<div style='font-size:0.78rem;color:#d4d4d8;margin-top:8px;line-height:1.35;'>{sig.rationale}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-                with st.expander("Ticket manual", expanded=True):
-                    valid_txt = sig.valid_until.split("T")[-1][:8] if sig.valid_until else "-"
-                    st.write(f"Entrada límite: **{_scalp_money(sig.plan_entry, 2)}** ({sig.entry_style})")
-                    st.write(f"Stop opción: **{_scalp_money(sig.plan_sl, 2)}** | TP opción: **{_scalp_money(sig.plan_tp, 2)}**")
-                    st.write(f"Stop GGAL: **{_scalp_money(sig.underlying_stop, 2)}** | TP GGAL: **{_scalp_money(sig.underlying_target, 2)}**")
-                    st.caption(
-                        f"PoP {sig.probability_of_profit * 100:.0f}% | EV/lote {_scalp_money(sig.expected_value_ars)} | "
-                        f"R:R {sig.plan_rr:.2f} | Riesgo stop/lote {_scalp_money(sig.planned_risk_ars)} | "
-                        f"Fricción {_scalp_money(sig.friction_ars)} ({sig.friction_pct:.2f}%) | "
-                        f"Fill {getattr(sig, 'fill_probability', 0.0) * 100:.0f}% | "
-                        f"Time stop {getattr(sig, 'time_stop_min', 20)} min | válido hasta {valid_txt}"
-                    )
-                    if getattr(sig, "warning_flags", []):
-                        st.caption("Advertencias: " + ", ".join(sig.warning_flags))
-                    default_lotes = max(int(sig.suggested_lots or 1), 1)
-                    if sig.suggested_lots <= 0:
-                        st.error("Sizing bloqueado: cargá capital o bajá riesgo antes de registrar.")
-                        continue
-                    lotes = st.number_input(
-                        "Lotes",
-                        min_value=1,
-                        max_value=max(int(sig.suggested_lots), 1),
-                        value=default_lotes,
-                        step=1,
-                        key=f"scalp_lotes_{sig.symbol}_{i}",
-                    )
-                    if st.button("EJECUTAR EN MERCADO", key=f"scalp_reg_{sig.symbol}_{i}", type="primary"):
-                        _execute_scalp_trade_live(sig, spot, lotes, caucion_tna, provider)
-                        st.success("¡Orden ENVIADA A IOL y registrada en Portfolio!")
+        # ── Pre-flight ────────────────────────────────────────────────────────
+        preflight = []
+        if not settings.is_iol_configured() or health.source != "IOL":
+            preflight.append("No estás usando IOL como fuente primaria.")
+        if capital_live is None or capital_live <= 0:
+            preflight.append("Cargá capital para sizing real.")
+        if not live_pulse.confirmed:
+            preflight.append("Esperando confirmacion direccional del tape live de GGAL.")
+        if snap_now is None:
+            preflight.append("Sin contexto tecnico disponible.")
+        if realized_vol is None:
+            preflight.append("Sin RV: gamma scalp menos confiable.")
+        if health.last_error:
+            preflight.append(f"Ultimo error del feed: {health.last_error}.")
 
-    def _signals_df(items: list) -> pd.DataFrame:
-        rows = []
-        for s in items:
-            g = greeks.get(s.symbol)
-            rows.append({
-                "Estado": s.confidence,
-                "Acción": s.action,
-                "Símbolo": s.symbol,
-                "Setup": s.playbook or s.signal_type,
-                "Score": round(s.score, 1),
-                "PoP": f"{s.probability_of_profit * 100:.0f}%",
-                "EV/lote": _scalp_money(s.expected_value_ars),
-                "Entrada": _scalp_money(s.plan_entry, 2),
-                "Stop": _scalp_money(s.plan_sl, 2),
-                "TP": _scalp_money(s.plan_tp, 2),
-                "R:R": f"{s.plan_rr:.2f}",
-                "Riesgo/lote": _scalp_money(s.planned_risk_ars),
-                "Fricción": _scalp_money(s.friction_ars),
-                "Edge/R": f"{getattr(s, 'edge_r', 0.0):+.2f}",
-                "Fill": f"{getattr(s, 'fill_probability', 0.0) * 100:.0f}%",
-                "Costo/target": f"{getattr(s, 'cost_to_target_pct', 0.0):.1f}%",
-                "BE mov": f"{s.breakeven_move_pct:.2f}%",
-                "Spread": f"{s.spread_pct:.1f}%",
-                "Edad": f"{getattr(g, 'quote_age_s', 0.0):.0f}s" if g else "-",
-                "Bloqueos": ", ".join(getattr(s, "blocking_flags", [])) if getattr(s, "blocking_flags", []) else "-",
-                "Advertencias": ", ".join(getattr(s, "warning_flags", [])) if getattr(s, "warning_flags", []) else "-",
-            })
-        return pd.DataFrame(rows)
+        if preflight:
+            st.caption("Pendiente: " + " | ".join(preflight))
+        else:
+            st.caption("Estado: feed, contexto, RV y capital listos.")
 
-    if actionables:
-        st.dataframe(_signals_df(actionables), hide_index=True, use_container_width=True)
-
-    st.markdown("### Watchlist")
-    if not watchlist:
-        st.info("Watchlist vacía.")
-    else:
-        reason_counts: dict[str, int] = {}
-        for s in watchlist:
-            for flag in getattr(s, "blocking_flags", []) or s.risk_flags:
-                reason_counts[flag] = reason_counts.get(flag, 0) + 1
-        if reason_counts:
-            top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
-            st.caption("Bloqueos principales: " + " | ".join(f"{k} ({v})" for k, v in top_reasons))
-        st.dataframe(_signals_df(watchlist[:40]), hide_index=True, use_container_width=True)
-
-    with st.expander("Auditoria / backtest scalping", expanded=False):
-        snap_dir = settings.snapshots_dir
-        files = list(snap_dir.glob("**/*.parquet")) if snap_dir.exists() else []
-        if files:
-            st.write(f"Snapshots disponibles para replay: **{len(files)}** archivos.")
+        # ── Gráfico de velas + niveles ────────────────────────────────────────
+        if verdict.signal is not None:
+            best = verdict.signal
+            side = "CALL" if verdict.decision == "BUY_CALL_NOW" else "PUT"
+            st.success(
+                f"**COMPRAR {side} AHORA: {best.symbol}** | limite {_scalp_money(best.plan_entry, 2)} | "
+                f"stop {_scalp_money(best.plan_sl, 2)} | TP {_scalp_money(best.plan_tp, 2)} | "
+                f"PoP {best.probability_of_profit * 100:.0f}% | EV {_scalp_money(best.expected_value_ars)}/lote"
+            )
             st.caption(
-                "El motor optionsdesk.backtest.scalping replayea planes sin lookahead: "
-                "entrada posterior a la senal, compra al ask, salida al bid, costos, TP, SL y time stop."
+                f"{verdict.mode} | {best.playbook} | {verdict.reason} | "
+                f"GGAL stop {_scalp_money(best.underlying_stop, 2)} / target {_scalp_money(best.underlying_target, 2)} | "
+                f"time stop {best.time_stop_min}min"
             )
         else:
-            st.info("Sin snapshots intradiarios todavia. El recorder debe acumular data antes de auditar parametros reales.")
+            st.warning(f"**{_scalp_wait_message(verdict)}**")
 
-    with st.expander("Griegas de la cadena y calidad de quotes", expanded=False):
-        rows = []
-        for g in sorted(greeks.values(), key=lambda x: (x.days, abs(x.moneyness_pct), x.symbol)):
-            rows.append({
-                "Símbolo": g.symbol,
-                "Tipo": "CALL" if g.option_type == "C" else "PUT",
-                "Strike": g.strike,
-                "DTE": g.days,
-                "Bid": g.bid,
-                "Ask": g.ask,
-                "Mid": g.mid,
-                "Spread %": g.spread_pct,
-                "IV %": f"{g.iv * 100:.1f}%" if g.iv else "-",
-                "Delta": g.delta,
-                "Gamma": g.gamma,
-                "Theta": g.theta,
-                "Vol": g.volume,
-                "Edad quote": f"{g.quote_age_s:.0f}s",
-                "Operable": g.is_tradeable,
-                "Motivo": g.liquidity_reason or "ok",
-            })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        daily_live = _daily_with_live_spot(spot_history_df, tape_samples, spot_now)
+        if chart_timeframe == "Tape 5m":
+            chart_df = _tape_ohlc(tape_samples, "5min")
+            chart_label = "Tape IOL 5m desde apertura del panel"
+            chart_smas = {"SMA5": 5, "SMA9": 9}
+            chart_max_bars = 72
+            chart_volume = False
+        elif chart_timeframe == "Diario":
+            chart_df = daily_live
+            chart_label = "Diario con vela live de hoy"
+            chart_smas = {"SMA9": 9, "SMA20": 20}
+            chart_max_bars = 90
+            chart_volume = True
+        elif chart_timeframe == "Semanal":
+            chart_df = _weekly_from_daily(daily_live)
+            chart_label = "Semanal con semana actual live"
+            chart_smas = {"SMA5": 5, "SMA20": 20}
+            chart_max_bars = 72
+            chart_volume = True
         else:
-            st.info("No se pudieron calcular griegas parseables para la cadena actual.")
+            chart_df = tape_1m
+            chart_label = "Tape IOL 1m desde apertura del panel"
+            chart_smas = {"SMA5": 5, "SMA9": 9}
+            chart_max_bars = 120
+            chart_volume = False
+        levels = [{"y": spot_now, "label": f"${spot_now:,.0f}", "color": "#9ca3af", "dash": "dot"}]
+
+        if actionables:
+            sig_labels = [
+                f"{s.action} {s.symbol} · PoP {s.probability_of_profit * 100:.0f}% · R:R {s.plan_rr:.1f}"
+                for s in actionables
+            ]
+            pick = st.selectbox(
+                "Señal en el gráfico",
+                range(len(actionables)),
+                format_func=lambda i: sig_labels[i],
+                key="scalp_chart_pick",
+            )
+            csig = actionables[pick]
+            if csig.underlying_target > 0:
+                levels.append({"y": csig.underlying_target, "label": f"TP ${csig.underlying_target:,.0f}", "color": "#26a69a", "dash": "dash"})
+            if csig.underlying_stop > 0:
+                levels.append({"y": csig.underlying_stop, "label": f"Stop ${csig.underlying_stop:,.0f}", "color": "#ef5350", "dash": "dash"})
+
+        _candlestick_chart(
+            chart_df, height=400,
+            smas=chart_smas,
+            levels=levels,
+            show_volume=chart_volume,
+            max_bars=chart_max_bars,
+        )
+        st.caption(
+            f"{chart_label} | actualizacion cada {interval_label}."
+        )
+
+        # ── Modo overnight: aviso solo cuando el operador lo habilito ─────────
+        overnight_active = any(
+            "setup_overnight" in getattr(s, "risk_flags", []) for s in signals
+        )
+        if overnight_active:
+            st.info(
+                "Modo overnight activo: filtros mas estrictos (DTE>=5, delta>=0.35), "
+                "sizing al 50% por gap risk. Los trades listados estan pensados para "
+                "mantener hasta la apertura del proximo dia."
+            )
+
+        # ── Señales accionables ───────────────────────────────────────────────
+        st.markdown("### Señales accionables")
+        if not actionables:
+            st.caption("Sin ticket habilitado: el veredicto superior indica la condicion pendiente.")
+        else:
+            cols = st.columns(min(3, len(actionables)))
+            for i, sig in enumerate(actionables[:3]):
+                color = _signal_color(sig)
+                with cols[i]:
+                    st.markdown(
+                        f"<div style='background:rgba(26,26,36,0.86);border-top:3px solid {color};"
+                        f"border-radius:8px;padding:12px;'>"
+                        f"<div style='font-size:0.72rem;color:#71717A;text-transform:uppercase;'>{sig.playbook} · {sig.urgency}</div>"
+                        f"<div style='font-size:1.2rem;font-weight:700;margin-top:2px;'>{sig.action} {sig.symbol}</div>"
+                        f"<div style='font-size:0.78rem;color:{color};font-weight:600;margin-top:4px;'>{sig.expected_move}</div>"
+                        f"<div style='font-size:0.78rem;color:#d4d4d8;margin-top:8px;line-height:1.35;'>{sig.rationale}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    with st.expander("Ticket", expanded=True):
+                        valid_txt = sig.valid_until.split("T")[-1][:8] if sig.valid_until else "-"
+                        st.write(f"Entrada: **{_scalp_money(sig.plan_entry, 2)}** ({sig.entry_style})")
+                        st.write(f"Stop opción: **{_scalp_money(sig.plan_sl, 2)}** · TP opción: **{_scalp_money(sig.plan_tp, 2)}**")
+                        st.write(f"Stop GGAL: **{_scalp_money(sig.underlying_stop, 2)}** · TP GGAL: **{_scalp_money(sig.underlying_target, 2)}**")
+                        st.caption(
+                            f"PoP {sig.probability_of_profit * 100:.0f}% · EV {_scalp_money(sig.expected_value_ars)} · "
+                            f"R:R {sig.plan_rr:.2f} · Riesgo {_scalp_money(sig.planned_risk_ars)}/lote · "
+                            f"Fricción {sig.friction_pct:.1f}% · Fill {getattr(sig, 'fill_probability', 0.0) * 100:.0f}% · "
+                            f"Time stop {getattr(sig, 'time_stop_min', 20)}min · válido hasta {valid_txt}"
+                        )
+                        if getattr(sig, "warning_flags", []):
+                            st.caption("Advertencias: " + _scalp_flags_text(sig.warning_flags))
+                        if sig.suggested_lots <= 0:
+                            st.error("Sizing bloqueado — cargá capital.")
+                        else:
+                            lotes = st.number_input(
+                                "Lotes", min_value=1, max_value=max(int(sig.suggested_lots), 1),
+                                value=max(int(sig.suggested_lots or 1), 1), step=1,
+                                key=f"scalp_lotes_{sig.symbol}_{i}",
+                            )
+                            if st.button("Registrar fill manual", key=f"scalp_reg_{sig.symbol}_{i}", type="primary"):
+                                _simulate_scalp_trade(sig, spot_now, lotes, caucion_tna)
+                                st.success("Fill registrado en Portfolio. El dashboard no envia ordenes al broker.")
+
+        # ── Tabla resumen ─────────────────────────────────────────────────────
+        def _max_loss_label(s) -> str:
+            unc = getattr(s, "max_loss_uncapped_ars", s.max_loss_ars)
+            if isinstance(unc, float) and unc == float("inf"):
+                return f"{_scalp_money(s.max_loss_ars)} (sin stop: ilimitado)"
+            if unc > s.max_loss_ars * 1.01:
+                return f"{_scalp_money(s.max_loss_ars)} (peor caso {_scalp_money(unc)})"
+            return _scalp_money(s.max_loss_ars)
+
+        def _signals_df(items: list) -> pd.DataFrame:
+            rows = []
+            for s in items:
+                g = greeks.get(s.symbol)
+                rows.append({
+                    "Acción": s.action, "Símbolo": s.symbol,
+                    "Setup": s.playbook or s.signal_type,
+                    "Score": round(s.score, 1),
+                    "PoP": f"{s.probability_of_profit * 100:.0f}%",
+                    "EV/lote": _scalp_money(s.expected_value_ars),
+                    "Entrada": _scalp_money(s.plan_entry, 2),
+                    "Stop": _scalp_money(s.plan_sl, 2),
+                    "TP": _scalp_money(s.plan_tp, 2),
+                    "R:R": f"{s.plan_rr:.2f}",
+                    "Riesgo/lote": _scalp_money(s.planned_risk_ars),
+                    "Max loss": _max_loss_label(s),
+                    "Fill": f"{getattr(s, 'fill_probability', 0.0) * 100:.0f}%",
+                    "Spread": f"{s.spread_pct:.1f}%",
+                    "Edad": f"{getattr(g, 'quote_age_s', 0.0):.0f}s" if g else "-",
+                    "Bloqueos": _scalp_flags_text(getattr(s, "blocking_flags", [])) or "-",
+                })
+            return pd.DataFrame(rows)
+
+        if actionables:
+            st.dataframe(_signals_df(actionables), hide_index=True, use_container_width=True)
+
+        # ── Watchlist ─────────────────────────────────────────────────────────
+        with st.expander(f"Radar y bloqueos ({len(watchlist)})", expanded=False):
+            if not watchlist:
+                st.caption("Sin contratos en radar.")
+            else:
+                reason_counts: dict[str, int] = {}
+                for s in watchlist:
+                    for flag in getattr(s, "blocking_flags", []) or s.risk_flags:
+                        reason_counts[flag] = reason_counts.get(flag, 0) + 1
+                if reason_counts:
+                    top = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    st.caption("Bloqueos: " + " | ".join(f"{_scalp_flag_label(k)} ({v})" for k, v in top))
+                st.dataframe(_signals_df(watchlist[:40]), hide_index=True, use_container_width=True)
+
+        # ── Griegas (expander para no ocupar pantalla por default) ────────────
+        with st.expander("Griegas de la cadena", expanded=False):
+            rows = []
+            for g in sorted(greeks.values(), key=lambda x: (x.days, abs(x.moneyness_pct))):
+                rows.append({
+                    "Símbolo": g.symbol, "Tipo": "C" if g.option_type == "C" else "P",
+                    "Strike": g.strike, "DTE": g.days,
+                    "Bid": g.bid, "Ask": g.ask, "Spread%": round(g.spread_pct, 1),
+                    "IV%": f"{g.iv * 100:.1f}" if g.iv else "-",
+                    "Delta": round(g.delta, 3), "Gamma": round(g.gamma, 5),
+                    "Theta": round(g.theta, 2), "Vol": g.volume,
+                    "Edad": f"{g.quote_age_s:.0f}s",
+                    "OK": "✓" if g.is_tradeable else g.liquidity_reason or "✗",
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("Sin griegas parseables.")
+
+    _live_panel()
 
 
 # ── Footer manual ─────────────────────────────────────────────────────────────
@@ -1812,13 +1990,7 @@ def _tab_scalping(
 def _data_footer() -> None:
     """Pie estable: no fuerza reruns ni parpadeos."""
     last_fetch = st.session_state.get("last_fetch_label", "sin cargar")
-    col_foot1, col_foot2 = st.columns([4, 1])
-    with col_foot1:
-        st.caption(f"Datos cargados: {last_fetch}")
-    with col_foot2:
-        if st.button("Actualizar datos", key="btn_refresh_main"):
-            st.session_state["force_refresh"] = True
-            st.rerun()
+    st.caption(f"Datos cargados: {last_fetch}")
 
 
 # ── App principal ─────────────────────────────────────────────────────────────
@@ -1835,8 +2007,9 @@ def main() -> None:
     with st.sidebar:
         st.header("OptionsDesk")
 
+        demo_default = os.environ.get("OPTIONS_DESK_DEFAULT_DEMO", "").lower() == "true"
         demo_mode = st.toggle(
-            "Modo demo", value=not (settings.is_iol_configured() or settings.is_configured()),
+            "Modo demo", value=demo_default or not (settings.is_iol_configured() or settings.is_configured()),
             help="Datos sinteticos. Activa cuando no hay credenciales.",
         )
         if st.button("Actualizar datos", key="btn_refresh_sidebar", use_container_width=True):
@@ -1849,23 +2022,11 @@ def main() -> None:
             help="balanced es el default para operar manualmente con dinero real.",
         )
 
-        st.divider()
-
-        capital_default = int(st.session_state.get("scalp_capital", settings.default_capital or 0) or 0)
-        capital_input = st.number_input(
-            "Capital disponible (ARS)",
-            min_value=0,
-            max_value=100_000_000,
-            value=capital_default,
-            step=50_000,
-            help="Para calcular cuantos lotes entran y la ganancia estimada en pesos.",
-            key="capital_sidebar",
-        )
-        capital = float(capital_input) if capital_input > 0 else None
-        st.session_state["scalp_capital"] = float(capital_input or 0)
+        capital_value = float(st.session_state.get("scalp_capital", settings.default_capital or 0) or 0)
+        capital = capital_value if capital_value > 0 else None
 
         directional_on = st.toggle(
-            "Contexto de mercado (experimental)",
+            "Contexto tecnico multi-TF",
             value=True,
             help="Ajuste leve basado en tendencia. Mejora con historial acumulado.",
         )
@@ -1873,7 +2034,7 @@ def main() -> None:
         advanced_mode = st.toggle(
             "Modo avanzado",
             value=False,
-            help="Suma tabs de análisis de tasas: Inicio, Oportunidades, Aprende, "
+            help="Suma tabs de análisis de tasas: Inicio, Oportunidades, Referencia, "
                  "Cadena completa, Simulador P&L e Historial.",
         )
 
@@ -1912,16 +2073,16 @@ def main() -> None:
     provider = _build_provider(demo_mode)
     expiry_cal = _load_expiry_calendar()
 
-    cc_scanner = CoveredCallScanner(CoveredCallConfig(price_mode=price_mode), expiry_cal)
-    sp_scanner = ShortPutScanner(
-        ShortPutConfig(price_mode=price_mode, capital_mode=capital_mode), expiry_cal
-    )
     screener = Screener(ScreenerConfig(min_tna_spread_pct=min_spread))
     alerter = TelegramAlerter()
 
     # ── Datos: carga inicial + refresh manual, sin parpadeo por auto-rerun ─────
     force_refresh = bool(st.session_state.pop("force_refresh", False))
-    if force_refresh or "chain" not in st.session_state:
+    provider_key = f"{'demo' if demo_mode else 'live'}:{provider.__class__.__name__}"
+    if st.session_state.get("provider_key") != provider_key:
+        st.session_state["provider_key"] = provider_key
+        force_refresh = True
+    if force_refresh or "chain" not in st.session_state or st.session_state.chain is None:
         with st.spinner("Cargando datos de mercado..."):
             st.session_state.chain = provider.get_options_chain()
             st.session_state.caucion_tna = provider.get_caucion_tna() or settings.default_caucion_tna
@@ -1933,6 +2094,11 @@ def main() -> None:
     if chain is None:
         st.error("Sin datos de mercado. Verifica la conexion o activa modo demo.")
         return
+    expiry_cal = _effective_expiry_calendar(chain, expiry_cal)
+    cc_scanner = CoveredCallScanner(CoveredCallConfig(price_mode=price_mode), expiry_cal)
+    sp_scanner = ShortPutScanner(
+        ShortPutConfig(price_mode=price_mode, capital_mode=capital_mode), expiry_cal
+    )
 
     benchmark = (
         Benchmark(caucion_tna_pct=caucion_tna, days=30)
@@ -1947,8 +2113,8 @@ def main() -> None:
     cc_filtered, sp_filtered = screener.rank(cc_all, sp_all, benchmark)
 
     # ── Historial del subyacente (para AT + VolEdge) ──────────────────────────
-    spot_history_df = _load_spot_history(days=180)
-    htf_df          = _load_htf_history(weeks=52)
+    spot_history_df = _load_spot_history(days=180, allow_synthetic=demo_mode)
+    htf_df          = _load_htf_history(weeks=52, allow_synthetic=demo_mode)
     ltf_df          = _load_ltf_history()
 
     spot_history_list: Optional[list[float]] = (
@@ -1981,7 +2147,7 @@ def main() -> None:
     c5.metric("Hora", pd.Timestamp.now().strftime("%H:%M:%S"), delta_color="off")
 
     if context is not None:
-        st.info(f"Mercado: {context.note}")
+        st.caption(f"Contexto tecnico: {context.note}")
 
     st.divider()
 
@@ -1991,7 +2157,7 @@ def main() -> None:
     if advanced_mode:
         tab_labels = [
             "Scalping", "Portfolio", "Direccional",
-            "Inicio", "Oportunidades", "Aprende",
+            "Inicio", "Oportunidades", "Referencia",
             "Cadena completa", "Simulador P&L", "Historial",
         ]
         (t_scalping, t_portfolio, t_dir, t_home, t_ops, t_learn,

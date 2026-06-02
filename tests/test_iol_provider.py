@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -112,3 +112,42 @@ def test_iol_get_retries_on_5xx(monkeypatch):
     out = p._get("bCBA/Titulos/GGAL/Cotizacion")
     assert out == {"ok": True}
     assert p.get_health().retries >= 1
+
+
+def test_iol_chain_carries_observed_multiletter_expiry(monkeypatch):
+    p = IOLProvider()
+    p._connected = True
+    p._token_mgr = _DummyTokenMgr()
+    spot = {
+        "ultimoPrecio": 4000.0,
+        "puntas": [{"precioCompra": 3999.0, "precioVenta": 4001.0}],
+        "volumenNominal": 1000,
+        "fechaHora": "2026-06-01T15:00:00-03:00",
+    }
+    option = {
+        "simbolo": "GFGC4000JU",
+        "fechaVencimiento": "2026-06-19T00:00:00",
+    }
+    quote = {
+        "ultimoPrecio": 150.0,
+        "puntas": [{"precioCompra": 149.0, "precioVenta": 151.0}],
+        "volumenNominal": 100,
+        "fechaHora": "2026-06-01T15:00:00-03:00",
+    }
+
+    def fake_get(path, quiet_statuses=None):  # noqa: ARG001
+        if path.endswith("/GGAL/Cotizacion"):
+            return spot
+        if path.endswith("/GGAL/Opciones"):
+            return [option]
+        if path.endswith("/GFGC4000JU/Cotizacion"):
+            return quote
+        raise AssertionError(path)
+
+    monkeypatch.setattr(p, "_get", fake_get)
+
+    chain = p.get_options_chain()
+
+    assert chain is not None
+    assert chain.expiry_calendar == {"JU": date(2026, 6, 19)}
+    assert "GFGC4000JU" in chain.options

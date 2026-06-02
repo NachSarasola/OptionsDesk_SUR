@@ -106,6 +106,8 @@ class TelegramAlerter:
         icons = {
             SignalType.TAKE_PROFIT: "✅",
             SignalType.STOP:        "🛑",
+            SignalType.TIME_STOP:   "⏱️",
+            SignalType.SESSION_CLOSE: "⏱️",
             SignalType.ROLL:        "🔄",
             SignalType.DEFEND:      "⚠️",
         }

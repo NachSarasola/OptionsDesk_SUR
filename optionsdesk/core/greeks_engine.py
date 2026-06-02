@@ -6,14 +6,16 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
+from optionsdesk.config.constants import DEFAULT_SIGMA_GGAL
 from optionsdesk.config.settings import settings
-from optionsdesk.core.instruments import OptionType, parse_option_symbol
+from optionsdesk.core.instruments import OptionType, merge_expiry_calendars, parse_option_symbol
 from optionsdesk.core.pricing import bs_delta, bs_gamma, bs_theta, bs_vega, implied_vol
 from optionsdesk.data.providers.base import OptionsChain
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_IV = 0.55
+# Fallback IV cuando implied_vol() no converge — usa la vol estructural de GGAL
+_DEFAULT_IV = DEFAULT_SIGMA_GGAL
 
 
 @dataclass
@@ -79,10 +81,11 @@ def compute_chain_greeks(
         return {}
 
     result: dict[str, OptionGreeks] = {}
+    effective_calendar = merge_expiry_calendars(expiry_calendar, chain.expiry_calendar)
     today = date.today()
 
     for sym, quote in chain.options.items():
-        contract = parse_option_symbol(sym, expiry_calendar, spot_hint=S)
+        contract = parse_option_symbol(sym, effective_calendar, spot_hint=S)
         if contract is None:
             continue
 

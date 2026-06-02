@@ -108,6 +108,7 @@ class DemoProvider(MarketDataProvider):
             underlying="GGAL",
             spot=spot_quote,
             options=options,
+            expiry_calendar=dict(future_expiries),
         )
 
     def is_connected(self) -> bool:

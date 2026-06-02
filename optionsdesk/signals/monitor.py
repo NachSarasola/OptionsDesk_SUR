@@ -29,7 +29,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POSITIONS_FILE = Path("data/open_positions.jsonl")
 _CRR_STEPS = 50
+
+
+def _optional_float(value) -> Optional[float]:
+    return float(value) if value not in (None, "") else None
 
 
 @dataclass
@@ -61,6 +65,19 @@ class OpenPosition:
     defend_delta: float = 0.50   # señal de defensa cuando |delta| ≥ defend_delta
     # Cantidad de contratos abiertos (v3.1) — default 1 para retrocompatibilidad
     contracts: int = 1
+    # Plan intradia opcional. Se conserva separado de la gestion swing por CRR.
+    opened_at: Optional[datetime] = None
+    scalp_plan_entry: Optional[float] = None
+    scalp_plan_sl: Optional[float] = None
+    scalp_plan_tp: Optional[float] = None
+    scalp_plan_rr: Optional[float] = None
+    scalp_pop: Optional[float] = None
+    scalp_expected_value_ars: Optional[float] = None
+    scalp_edge_r: Optional[float] = None
+    scalp_fill_probability: Optional[float] = None
+    scalp_cost_to_target_pct: Optional[float] = None
+    scalp_time_stop_min: Optional[int] = None
+    scalp_allow_overnight: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "OpenPosition":
@@ -81,6 +98,18 @@ class OpenPosition:
             roll_dte=int(d.get("roll_dte", 21)),
             defend_delta=float(d.get("defend_delta", 0.50)),
             contracts=int(d.get("contracts", 1)),
+            opened_at=datetime.fromisoformat(d["opened_at"]) if d.get("opened_at") else None,
+            scalp_plan_entry=_optional_float(d.get("scalp_plan_entry")),
+            scalp_plan_sl=_optional_float(d.get("scalp_plan_sl")),
+            scalp_plan_tp=_optional_float(d.get("scalp_plan_tp")),
+            scalp_plan_rr=_optional_float(d.get("scalp_plan_rr")),
+            scalp_pop=_optional_float(d.get("scalp_pop")),
+            scalp_expected_value_ars=_optional_float(d.get("scalp_expected_value_ars")),
+            scalp_edge_r=_optional_float(d.get("scalp_edge_r")),
+            scalp_fill_probability=_optional_float(d.get("scalp_fill_probability")),
+            scalp_cost_to_target_pct=_optional_float(d.get("scalp_cost_to_target_pct")),
+            scalp_time_stop_min=int(d["scalp_time_stop_min"]) if d.get("scalp_time_stop_min") is not None else None,
+            scalp_allow_overnight=bool(d.get("scalp_allow_overnight", False)),
         )
 
     @property
@@ -128,6 +157,34 @@ class PositionMonitor:
                 except (KeyError, ValueError) as exc:
                     logger.warning("Línea inválida en posiciones: %.60s — %s", line, exc)
         return positions
+
+    def remove_position_at(self, index: int) -> bool:
+        """Elimina una posicion local por indice sin descartar lineas desconocidas."""
+        if index < 0 or not self._file.exists():
+            return False
+
+        retained: list[str] = []
+        valid_index = -1
+        removed = False
+        for raw_line in self._file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                OpenPosition.from_dict(json.loads(line))
+                valid_index += 1
+            except (KeyError, ValueError):
+                retained.append(raw_line)
+                continue
+            if valid_index == index:
+                removed = True
+                continue
+            retained.append(raw_line)
+
+        if removed:
+            payload = "\n".join(retained)
+            self._file.write_text(payload + ("\n" if payload else ""), encoding="utf-8")
+        return removed
 
     def compute_capture(
         self,

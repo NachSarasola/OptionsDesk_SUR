@@ -117,6 +117,16 @@ def days_to_expiry(symbol: str, expiry_calendar: Optional[dict[str, date]] = Non
     return contract.days_to_expiry if contract is not None else 0
 
 
+def merge_expiry_calendars(
+    fallback: Optional[dict[str, date]] = None,
+    observed: Optional[dict[str, date]] = None,
+) -> dict[str, date]:
+    """Combina calendario local y observado; el feed live tiene prioridad."""
+    merged = dict(fallback or {})
+    merged.update(observed or {})
+    return merged
+
+
 def load_expiry_calendar(config_path: Optional[str] = None) -> dict[str, date]:
     """Carga el mapa código → fecha desde instruments.yaml."""
     import yaml

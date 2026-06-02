@@ -52,3 +52,22 @@ def test_chain_greeks_marks_stale_as_not_tradeable(mock_expiry_cal):
     g = greeks["GFGC4000A"]
     assert g.is_tradeable is False
     assert "stale" in g.liquidity_reason
+
+
+def test_chain_greeks_uses_observed_expiry_calendar_from_chain():
+    from datetime import date, timedelta
+
+    spot_quote = Quote("GGAL", 4000.0, 4000.0, 4000.0, 1000, datetime.now())
+    options = {
+        "GFGC4000JU": Quote("GFGC4000JU", 150.0, 160.0, 155.0, 100, datetime.now()),
+    }
+    chain = OptionsChain(
+        "GGAL",
+        spot_quote,
+        options,
+        expiry_calendar={"JU": date.today() + timedelta(days=30)},
+    )
+
+    greeks = compute_chain_greeks(chain, expiry_calendar={})
+
+    assert "GFGC4000JU" in greeks

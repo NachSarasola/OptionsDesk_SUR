@@ -8,7 +8,7 @@ from typing import Optional
 
 from optionsdesk.config.costs import CostModel, DEFAULT_COSTS
 from optionsdesk.core.benchmark import Benchmark
-from optionsdesk.core.instruments import OptionType, parse_option_symbol
+from optionsdesk.core.instruments import OptionType, merge_expiry_calendars, parse_option_symbol
 from optionsdesk.core.pricing import crr_delta, implied_vol
 from optionsdesk.core.rates import RateResult, compute_short_put
 from optionsdesk.data.providers.base import OptionsChain, Quote
@@ -53,9 +53,10 @@ class ShortPutScanner(Strategy):
 
         r = math.log(1.0 + benchmark.caucion_tna_pct / 100.0) if benchmark.caucion_tna_pct > 0 else 0.0
         results: list[RateResult] = []
+        effective_calendar = merge_expiry_calendars(self._expiry_cal, chain.expiry_calendar)
 
         for sym, quote in chain.options.items():
-            contract = parse_option_symbol(sym, self._expiry_cal)
+            contract = parse_option_symbol(sym, effective_calendar)
             if contract is None or contract.option_type != OptionType.PUT:
                 continue
 

@@ -128,6 +128,15 @@ def test_daily_fallback_when_pyobd_unavailable():
         assert len(df) <= 30
 
 
+def test_daily_can_disable_synthetic_fallback_for_live_mode():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = UnderlyingHistory(cache_dir=Path(tmp))
+        with patch.dict("sys.modules", {"pyobd": None}):
+            df = h.daily("GGAL", days=30, allow_synthetic=False)
+        assert df.empty
+        assert list(df.columns) == ["date", "open", "high", "low", "close", "volume"]
+
+
 def test_daily_uses_cache_when_fresh():
     """Si hay caché fresco, lo usa sin llamar a PyOBD."""
     with tempfile.TemporaryDirectory() as tmp:

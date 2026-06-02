@@ -183,6 +183,7 @@ class IOLProvider(MarketDataProvider):
 
         self._options_seen = len(data)
         symbols: list[str] = []
+        observed_expiry_calendar: dict[str, date] = {}
 
         from optionsdesk.core.instruments import parse_option_symbol
 
@@ -191,7 +192,19 @@ class IOLProvider(MarketDataProvider):
             sym = str(item.get("simbolo", "")).upper().strip()
             if not (sym and sym.startswith("GFG")):
                 continue
-            contract = parse_option_symbol(sym, dummy_cal)
+            match = re.match(r"^GFG[CV]\d+(?:[.,]\d+)?([A-Z]+)$", sym)
+            expiry_raw = str(item.get("fechaVencimiento", "") or "")[:10]
+            if match and expiry_raw:
+                try:
+                    code = match.group(1)
+                    expiration = date.fromisoformat(expiry_raw)
+                    previous = observed_expiry_calendar.get(code)
+                    if previous is not None and previous != expiration:
+                        logger.warning("IOL: codigo %s con vencimientos inconsistentes: %s / %s", code, previous, expiration)
+                    observed_expiry_calendar[code] = expiration
+                except ValueError:
+                    logger.debug("IOL: vencimiento invalido para %s: %s", sym, expiry_raw)
+            contract = parse_option_symbol(sym, {**dummy_cal, **observed_expiry_calendar})
             if not contract:
                 symbols.append(sym)
                 continue
@@ -228,7 +241,12 @@ class IOLProvider(MarketDataProvider):
                     opts[q.symbol] = q
 
         self._options_tradeable = sum(1 for q in opts.values() if q.bid > 0 and q.ask > 0)
-        return OptionsChain(underlying=self._UNDERLYING, spot=spot, options=opts)
+        return OptionsChain(
+            underlying=self._UNDERLYING,
+            spot=spot,
+            options=opts,
+            expiry_calendar=observed_expiry_calendar,
+        )
 
     def get_caucion_tna(self, days: int = 30) -> Optional[float]:
         for panel in ("general", "todos"):
@@ -298,47 +316,6 @@ class IOLProvider(MarketDataProvider):
                     continue
                 logger.warning("IOL GET %s fallo: %s", path, exc)
                 return None
-
-    def _post(self, path: str, json_data: dict) -> Optional[dict]:
-        if not self._token_mgr:
-            raise RuntimeError("IOLProvider no conectado. Llama connect() primero.")
-        url = f"{_BASE_URL}/{path}"
-        headers = self._token_mgr.get_headers()
-        try:
-            resp = self._session.post(url, headers=headers, json=json_data, timeout=5)
-            if resp.status_code == 401:
-                self._token_mgr._do_login()
-                headers = self._token_mgr.get_headers()
-                resp = self._session.post(url, headers=headers, json=json_data, timeout=5)
-            
-            if resp.status_code >= 400:
-                logger.error("IOL POST %s fallo: HTTP %d %s", path, resp.status_code, resp.text)
-                return None
-            return resp.json()
-        except Exception as exc:
-            logger.error("IOL POST %s error: %s", path, exc)
-            return None
-
-    def send_order(self, symbol: str, is_buy: bool, quantity: int, price: float) -> bool:
-        """Envia orden limite de compra o venta a IOL."""
-        action = "Comprar" if is_buy else "Vender"
-        path = f"api/v2/operar/{action}"
-        payload = {
-            "mercado": "bCBA",
-            "simbolo": symbol,
-            "cantidad": int(quantity),
-            "precio": float(price),
-            "plazo": "t0",
-            "validez": str(datetime.now().date()) + "T23:59:59.999Z"
-        }
-        logger.info("Enviando orden a IOL: %s", payload)
-        resp = self._post(path, payload)
-        if resp and resp.get("ok"):
-            logger.info("Orden IOL aceptada: %s", resp)
-            return True
-        return False
-        return None
-
 
 def _parse_quote(symbol: str, data: dict) -> Optional[Quote]:
     """Construye un Quote desde la respuesta JSON de IOL."""

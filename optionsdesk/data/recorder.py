@@ -145,3 +145,32 @@ class ChainRecorder:
         if not files:
             return None
         return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def _build_provider() -> MarketDataProvider:
+    """Construye una fuente real para no grabar datos sinteticos por accidente."""
+    if settings.is_iol_configured():
+        from optionsdesk.data.providers.iol import IOLProvider
+        provider: MarketDataProvider = IOLProvider()
+    elif settings.is_configured():
+        from optionsdesk.data.providers.homebroker import HomeBrokerProvider
+        provider = HomeBrokerProvider()
+    else:
+        raise RuntimeError("Configura credenciales IOL o HomeBroker antes de iniciar el recorder.")
+    provider.connect()
+    return provider
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    provider = _build_provider()
+    try:
+        ChainRecorder(provider).run()
+    except KeyboardInterrupt:
+        logger.info("Recorder detenido.")
+    finally:
+        provider.disconnect()
+
+
+if __name__ == "__main__":
+    main()

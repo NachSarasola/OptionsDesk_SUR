@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time as dt_time
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
@@ -31,6 +31,8 @@ _CRR_STEPS = 50
 class SignalType(str, Enum):
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP        = "STOP"
+    TIME_STOP   = "TIME_STOP"
+    SESSION_CLOSE = "SESSION_CLOSE"
     ROLL        = "ROLL"
     DEFEND      = "DEFEND"
     HOLD        = "HOLD"
@@ -90,6 +92,81 @@ def _capture_pct(pos: "OpenPosition", current_ov: float) -> float:
         return 0.0
     pnl = pos.premium_received - current_ov
     return max(pnl / pos.premium_received * 100.0, 0.0)
+
+
+def evaluate_scalp_quote_position(
+    pos: "OpenPosition",
+    current_option_price: float,
+    now: Optional[datetime] = None,
+) -> ManagementSignal:
+    """Evalua un scalp contra su quote ejecutable y su reloj intradia."""
+    strategy = str(pos.strategy).upper()
+    if "SCALP" not in strategy:
+        raise ValueError("evaluate_scalp_quote_position requiere una posicion SCALP")
+
+    mark = max(float(current_option_price), 0.0)
+    is_long = "LONG" in strategy
+    entry = float(pos.scalp_plan_entry or (pos.net_outlay if is_long else pos.premium_received) or 0.0)
+    sl = pos.scalp_plan_sl
+    tp = pos.scalp_plan_tp
+    if entry <= 0:
+        return ManagementSignal(
+            signal_type=SignalType.HOLD,
+            reason="Falta el precio de entrada del scalp.",
+            suggested_action="Revisa la carga local antes de decidir.",
+            capture_pct=0.0,
+        )
+
+    pnl_pct = ((mark - entry) if is_long else (entry - mark)) / entry * 100.0
+    if tp is not None and ((is_long and mark >= tp) or (not is_long and mark <= tp)):
+        return ManagementSignal(
+            signal_type=SignalType.TAKE_PROFIT,
+            reason=f"Quote ejecutable ${mark:,.2f}: objetivo ${tp:,.2f} alcanzado.",
+            suggested_action=f"Cerra {pos.symbol} con orden limite y marca la posicion como cerrada.",
+            capture_pct=pnl_pct,
+        )
+    if sl is not None and ((is_long and mark <= sl) or (not is_long and mark >= sl)):
+        return ManagementSignal(
+            signal_type=SignalType.STOP,
+            reason=f"Quote ejecutable ${mark:,.2f}: stop ${sl:,.2f} alcanzado.",
+            suggested_action=f"Cerra {pos.symbol}; el setup intradia dejo de ser valido.",
+            capture_pct=pnl_pct,
+        )
+
+    current = now or datetime.now(tz=pos.opened_at.tzinfo if pos.opened_at else None)
+    if (
+        not getattr(pos, "scalp_allow_overnight", False)
+        and current.weekday() < 5
+        and current.time() >= dt_time(16, 50)
+    ):
+        return ManagementSignal(
+            signal_type=SignalType.SESSION_CLOSE,
+            reason="Quedan menos de 10 min de rueda y el scalp fue abierto como intradia.",
+            suggested_action=f"Cerra {pos.symbol}; no conviertas un scalp en overnight por inercia.",
+            capture_pct=pnl_pct,
+        )
+
+    opened_at = pos.opened_at
+    time_stop_min = pos.scalp_time_stop_min
+    if opened_at is not None and time_stop_min is not None and time_stop_min > 0:
+        current = now or datetime.now(tz=opened_at.tzinfo)
+        if opened_at.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        held_min = max((current - opened_at).total_seconds() / 60.0, 0.0)
+        if held_min >= time_stop_min:
+            return ManagementSignal(
+                signal_type=SignalType.TIME_STOP,
+                reason=f"Pasaron {held_min:.0f} min sin salida; time stop {time_stop_min} min.",
+                suggested_action=f"Revalida el momentum y prioriza cerrar {pos.symbol}.",
+                capture_pct=pnl_pct,
+            )
+
+    return ManagementSignal(
+        signal_type=SignalType.HOLD,
+        reason=f"Scalp activo: quote ejecutable ${mark:,.2f}, P&L bruto {pnl_pct:+.1f}%.",
+        suggested_action="Mantenelo solo mientras el setup minuto a minuto siga vigente.",
+        capture_pct=pnl_pct,
+    )
 
 
 def evaluate_position(

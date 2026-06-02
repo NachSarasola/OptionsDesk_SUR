@@ -1,26 +1,13 @@
 # Watchlist y configuración de instrumentos GGAL
 underlying: GGAL
 
-# Mapa de códigos de vencimiento → fecha real (tercer viernes del mes).
-# Actualizar al inicio de cada ciclo. Los vencimientos de GGAL son mensuales.
-# Convención BYMA: calls y puts del mismo vencimiento comparten código.
-# Verificar los códigos vigentes en Bull Market / OptionsDesk antes de operar.
+# Codigos de vencimiento publicados por IOL para GGAL.
+# Validado contra la cadena live el 2026-06-01. Actualizar al inicio de cada ciclo.
 expiry_calendar:
-  # Ejemplos para 2026 — reemplazar con los reales
-  D: "2026-04-17"
-  E: "2026-05-15"
-  F: "2026-06-19"
-  G: "2026-07-17"
-  H: "2026-08-21"
-  I: "2026-09-18"
+  # Codigos observados en IOL el 2026-06-01
   J: "2026-06-19"
-  JN: "2026-06-19"
-  JL: "2026-07-17"
+  JU: "2026-06-19"
   AG: "2026-08-21"
-  SE: "2026-09-18"
-  OC: "2026-10-16"
-  "NO": "2026-11-20"
-  DI: "2026-12-18"
 
 # Filtros de liquidez mínima
 min_bid: 1.0           # prima mínima en el bid (ARS)

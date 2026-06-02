@@ -15,7 +15,7 @@ from typing import Optional
 
 from optionsdesk.config.costs import CostModel, DEFAULT_COSTS
 from optionsdesk.core.benchmark import Benchmark
-from optionsdesk.core.instruments import OptionType, parse_option_symbol
+from optionsdesk.core.instruments import OptionType, merge_expiry_calendars, parse_option_symbol
 from optionsdesk.core.pricing import implied_vol
 from optionsdesk.core.spreads import (
     SpreadResult,
@@ -83,12 +83,13 @@ class VerticalSpreadScanner:
         # key  : (OptionType, expiry_code, expiration_date, days)
         # value: {strike → (symbol, Quote, implied_vol_or_default)}
         groups: dict[tuple, dict[float, tuple[str, Quote, float]]] = {}
+        effective_calendar = merge_expiry_calendars(self._expiry_cal, chain.expiry_calendar)
 
         lo_band = S * (1 - self._cfg.spot_band_pct)
         hi_band = S * (1 + self._cfg.spot_band_pct)
 
         for sym, quote in chain.options.items():
-            contract = parse_option_symbol(sym, self._expiry_cal)
+            contract = parse_option_symbol(sym, effective_calendar)
             if contract is None:
                 continue
             days = contract.days_to_expiry

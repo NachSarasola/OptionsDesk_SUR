@@ -1,8 +1,8 @@
 """Interfaz para la ejecución de órdenes.
 
-v1 entrega solo PaperExecutor (registra órdenes, nunca envía nada).
-Para escalar a automático: implementar un executor real (BullMarketExecutor
-o IOLExecutor) que implemente esta misma interfaz, sin tocar el motor de señales.
+La app entrega solo PaperExecutor (registra órdenes, nunca envía nada).
+La operatoria real queda manual hasta contar con una integración de broker
+validada y probada contra la API vigente.
 """
 from __future__ import annotations
 

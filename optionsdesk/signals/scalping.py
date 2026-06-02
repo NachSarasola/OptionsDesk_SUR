@@ -9,14 +9,22 @@ from statistics import median
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from scipy.stats import norm
+
 from optionsdesk.config.costs import DEFAULT_COSTS
 from optionsdesk.config.settings import settings
 from optionsdesk.core.greeks_engine import OptionGreeks, compute_chain_greeks
 from optionsdesk.data.providers.base import OptionsChain
 
+# Ventana operativa del scanner: 11:00 a 17:00. BYMA abre concertacion antes;
+# dejamos un buffer inicial para no tomar la microestructura de apertura.
+_SESSION_HOURS = 6.0
+_TRADING_DAYS_YEAR = 252.0
+
 _PROFILE_CFG = {
     "conservative": {
         "max_spread": 10.0,
+        "spread_extreme_block": 22.0,
         "min_rr": 1.6,
         "max_age_s": 60.0,
         "vol_edge_min": 0.04,
@@ -26,12 +34,14 @@ _PROFILE_CFG = {
         "min_score_actionable": 64.0,
         "min_pop": 0.56,
         "max_breakeven_move_pct": 0.28,
+        "time_stop_min": 15,
+        "flat_before_close_min": 15,
         "allow_edge_session": False,
     },
     "balanced": {
         "max_spread": 22.0,
         "spread_extreme_block": 35.0,
-        "min_rr": 0.80,
+        "min_rr": 1.2,
         "max_age_s": 90.0,
         "vol_edge_min": 0.02,
         "min_action_delta": 0.25,
@@ -103,6 +113,7 @@ class ScalpSignal:
     confidence: str = "watchlist"
     risk_flags: list[str] = field(default_factory=list)
     max_loss_ars: float = 0.0
+    max_loss_uncapped_ars: float = 0.0
     suggested_lots: int = 0
     valid_until: str = ""
     playbook: str = ""
@@ -127,6 +138,131 @@ class ScalpSignal:
     time_stop_min: int = 20
     blocking_flags: list[str] = field(default_factory=list)
     warning_flags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LivePulse:
+    """Confirmacion direccional observada durante la sesion."""
+
+    confirmed: bool
+    direction: str = "NEUTRAL"
+    momentum_pct: float = 0.0
+    observations: int = 0
+    span_s: float = 0.0
+    source: str = "spot_tape"
+
+
+@dataclass
+class ScalpVerdict:
+    """Decision operativa unica para el panel de scalping."""
+
+    decision: str
+    reason: str
+    signal: Optional[ScalpSignal] = None
+    blockers: list[str] = field(default_factory=list)
+    session_phase: str = ""
+    pulse: Optional[LivePulse] = None
+    mode: str = "INTRADAY"
+
+
+def compute_spot_tape_pulse(
+    samples: list[tuple[datetime, float]],
+    *,
+    min_observations: int = 5,
+    min_span_s: float = 60.0,
+    min_move_pct: float = 0.08,
+    source: str = "spot_tape_iol",
+) -> LivePulse:
+    """Resume un tape corto de spot sin inventar barras ni hacer lookahead."""
+    clean = sorted(
+        (ts, float(px))
+        for ts, px in samples
+        if isinstance(ts, datetime) and float(px or 0.0) > 0
+    )
+    if not clean:
+        return LivePulse(False, source=source)
+
+    span_s = max((clean[-1][0] - clean[0][0]).total_seconds(), 0.0)
+    first = clean[0][1]
+    last = clean[-1][1]
+    move_pct = ((last / first) - 1.0) * 100.0 if first > 0 else 0.0
+    direction = (
+        "BULL" if move_pct >= min_move_pct
+        else "BEAR" if move_pct <= -min_move_pct
+        else "NEUTRAL"
+    )
+    confirmed = len(clean) >= min_observations and span_s >= min_span_s and direction != "NEUTRAL"
+    return LivePulse(
+        confirmed=confirmed,
+        direction=direction,
+        momentum_pct=round(move_pct, 4),
+        observations=len(clean),
+        span_s=round(span_s, 1),
+        source=source,
+    )
+
+
+def build_scalp_verdict(
+    signals: list[ScalpSignal],
+    *,
+    feed_live: bool,
+    capital: Optional[float],
+    pulse: LivePulse,
+    allow_overnight_entries: bool = False,
+    session_phase: Optional[str] = None,
+) -> ScalpVerdict:
+    """Devuelve COMPRAR CALL, COMPRAR PUT o ESPERAR con motivos verificables."""
+    phase = session_phase or _current_session_phase()
+    mode = "OVERNIGHT" if allow_overnight_entries and phase == "close" else "INTRADAY"
+    blockers: list[str] = []
+    if not feed_live:
+        blockers.append("feed_no_live")
+    if not capital or capital <= 0:
+        blockers.append("capital_no_cargado")
+    if phase == "closed":
+        blockers.append("fuera_horario_byma")
+    if phase == "close" and not allow_overnight_entries:
+        blockers.append("cierre_intradia")
+    if not pulse.confirmed:
+        blockers.append("sin_confirmacion_intradia_live")
+
+    if blockers:
+        return ScalpVerdict(
+            decision="WAIT",
+            reason=", ".join(dict.fromkeys(blockers)),
+            blockers=list(dict.fromkeys(blockers)),
+            session_phase=phase,
+            pulse=pulse,
+            mode=mode,
+        )
+
+    viable = [
+        sig for sig in signals
+        if sig.confidence == "actionable" and sig.action in ("BUY_CALL", "BUY_PUT")
+    ]
+    if not viable:
+        signal_blockers: list[str] = []
+        for sig in signals[:5]:
+            signal_blockers.extend(sig.blocking_flags)
+        blockers = list(dict.fromkeys(signal_blockers))[:5] or ["sin_setup_viable"]
+        return ScalpVerdict(
+            decision="WAIT",
+            reason=", ".join(blockers),
+            blockers=blockers,
+            session_phase=phase,
+            pulse=pulse,
+            mode=mode,
+        )
+
+    best = max(viable, key=_signal_rank)
+    return ScalpVerdict(
+        decision="BUY_CALL_NOW" if best.action == "BUY_CALL" else "BUY_PUT_NOW",
+        reason=best.trigger or best.rationale,
+        signal=best,
+        session_phase=phase,
+        pulse=pulse,
+        mode=mode,
+    )
 
 
 def _round_price(value: float) -> float:
@@ -196,6 +332,7 @@ def _trade_plan_detail(
             "rr": 0.0,
             "planned_risk_ars": 0.0,
             "max_loss_ars": 0.0,
+            "max_loss_uncapped_ars": 0.0,
             "fees_ars": 0.0,
             "spread_cost_ars": 0.0,
             "breakeven_move_pct": 0.0,
@@ -299,26 +436,41 @@ def _trade_plan_detail(
         stop_fee = _option_cost(sl_opt, "option_sell")
         target_fee = _option_cost(tp_opt, "option_sell")
         planned_risk = max((entry - sl_opt) * 100.0 + entry_fee + stop_fee, 0.0)
+        # reward NO incluye spread porque entry ya esta sobre el mid (half_spread*aggression)
         reward = (tp_opt - entry) * 100.0 - entry_fee - target_fee
         max_loss = entry * 100.0 + entry_fee
         spread_cost = max(entry - g.mid, 0.0) * 100.0
         round_trip_at_entry = entry_fee + _option_cost(entry, "option_sell")
-        breakeven_move_pct = (
-            ((spread_cost + round_trip_at_entry) / 100.0) / max(abs(g.delta), 0.05) / spot * 100.0
-            if spot > 0
-            else 0.0
-        )
+        # BE cuadratico: delta*ds + 0.5*gamma*ds^2 = cost/100 -> resolver ds positivo
+        cost_per_share = (spread_cost + round_trip_at_entry) / 100.0
+        delta_abs = max(abs(g.delta), 1e-4)
+        gamma_abs = max(g.gamma, 0.0)
+        if gamma_abs > 1e-8 and spot > 0:
+            disc = delta_abs * delta_abs + 2.0 * gamma_abs * cost_per_share
+            ds = (-delta_abs + math.sqrt(max(disc, 0.0))) / gamma_abs
+        else:
+            ds = cost_per_share / delta_abs
+        breakeven_move_pct = (ds / spot * 100.0) if spot > 0 else 0.0
         fees = entry_fee + target_fee
+        max_loss_uncapped = max_loss
     else:
         entry_fee = _option_cost(entry, "option_sell")
         stop_fee = _option_cost(sl_opt, "option_buy")
         target_fee = _option_cost(tp_opt, "option_buy")
         planned_risk = max((sl_opt - entry) * 100.0 + entry_fee + stop_fee, 0.0)
         reward = (entry - tp_opt) * 100.0 - entry_fee - target_fee
-        max_loss = planned_risk
         spread_cost = max(g.mid - entry, 0.0) * 100.0
         breakeven_move_pct = 0.0
         fees = entry_fee + target_fee
+        # Max loss real: SELL_PUT acotado a strike*100 - prima; SELL_CALL ilimitado sin stop forzado
+        if is_call:
+            # SELL_CALL: si se respeta el sl_opt forzado, max_loss = (sl - entry)*100 + fees
+            max_loss = planned_risk
+            max_loss_uncapped = float("inf")
+        else:
+            # SELL_PUT: subyacente a 0 -> perdida = strike*100 - prima*100 + fees
+            max_loss = max(g.strike * 100.0 - entry * 100.0 + entry_fee + stop_fee, planned_risk)
+            max_loss_uncapped = max_loss
 
     rr = reward / planned_risk if planned_risk > 0 else 0.0
     return {
@@ -328,6 +480,7 @@ def _trade_plan_detail(
         "rr": round(max(rr, 0.0), 2),
         "planned_risk_ars": round(planned_risk, 2),
         "max_loss_ars": round(max_loss, 2),
+        "max_loss_uncapped_ars": max_loss_uncapped if math.isinf(max_loss_uncapped) else round(max_loss_uncapped, 2),
         "fees_ars": round(fees, 2),
         "spread_cost_ars": round(spread_cost, 2),
         "breakeven_move_pct": round(breakeven_move_pct, 2),
@@ -444,14 +597,17 @@ def _session_flags(cfg: dict[str, float]) -> list[str]:
     if now.weekday() >= 5:
         return ["fuera_horario_byma"]
 
-    open_t = dt_time(11, 0)
-    start_ok = dt_time(11, 5)
-    end_ok = dt_time(16, 55)
-    close_t = dt_time(17, 0)
+    open_dt = now.replace(hour=11, minute=0, second=0, microsecond=0)
+    close_dt = now.replace(hour=17, minute=0, second=0, microsecond=0)
+    start_ok_dt = open_dt + timedelta(minutes=5)
+    end_ok_dt = close_dt - timedelta(minutes=int(cfg.get("flat_before_close_min", 10)))
     t = now.time()
-    if t < open_t or t >= close_t:
+    if t < open_dt.time() or t >= close_dt.time():
         return ["fuera_horario_byma"]
-    if not bool(cfg.get("allow_edge_session")) and (t < start_ok or t >= end_ok):
+    # En modo overnight, la fase de cierre es operable (es lo que el modo busca)
+    if cfg.get("overnight_mode"):
+        return []
+    if not bool(cfg.get("allow_edge_session")) and (t < start_ok_dt.time() or t >= end_ok_dt.time()):
         return ["apertura_cierre_byma"]
     return []
 
@@ -581,13 +737,13 @@ def _near_zone(spot: float, low: float, high: float, tolerance_pct: float = 1.8)
 
 def _liquidity_score(g: OptionGreeks, cfg: dict[str, float]) -> float:
     max_spread = max(float(cfg["max_spread"]), 1.0)
-    spread_score = 18.0 - (g.spread_pct / max_spread) * 25.0
+    spread_score = max(18.0 - (g.spread_pct / max_spread) * 25.0, 0.0)
     volume_score = min(math.log10(max(g.volume, 0.0) + 1.0) * 5.0, 14.0)
     size_score = min(math.log10(max(g.bid_size + g.ask_size, 0.0) + 1.0) * 3.0, 8.0)
     return spread_score + volume_score + size_score
 
 
-def _signal_rank(sig: ScalpSignal) -> tuple[int, float, float, float, float, float, float]:
+def _signal_rank(sig: ScalpSignal) -> tuple[int, float, float, float, float, float, float, float]:
     """Ranking PoP-first: operar primero la mayor probabilidad viable."""
     risk = max(sig.planned_risk_ars, 0.01)
     ev_per_risk = sig.expected_value_ars / risk
@@ -603,8 +759,20 @@ def _signal_rank(sig: ScalpSignal) -> tuple[int, float, float, float, float, flo
     )
 
 
-def _estimate_long_pop(sig: ScalpSignal, g: OptionGreeks, snap) -> float:
-    """Estimacion conservadora de PoP intradia para compras de calls/puts."""
+def _estimate_long_pop(
+    sig: ScalpSignal,
+    g: OptionGreeks,
+    snap,
+    realized_vol: Optional[float] = None,
+    horizon_min: Optional[float] = None,
+) -> float:
+    """Estimacion conservadora de PoP intradia para compras de calls/puts.
+
+    Base = probabilidad de tocar target antes que stop bajo random walk con drift 0
+    (b/(a+b)) modulada por feasibility = norm.cdf(min(a,b)/sigma_horizon).
+    Si no se mueve nada en el horizonte, feasibility -> 0 y PoP tiende a 0.5
+    (toss-up). Si vol cubre ampliamente ambas barreras, PoP tiende a b/(a+b).
+    """
     if not sig.action.startswith("BUY_") or sig.underlying_stop <= 0 or sig.underlying_target <= 0:
         return 0.0
 
@@ -618,7 +786,20 @@ def _estimate_long_pop(sig: ScalpSignal, g: OptionGreeks, snap) -> float:
     if stop_dist <= 0 or target_dist <= 0:
         base = 0.45
     else:
-        base = stop_dist / (stop_dist + target_dist)
+        naive = stop_dist / (stop_dist + target_dist)
+        if realized_vol and realized_vol > 0 and spot > 0:
+            # RV anualizada -> stddev del log-return en el horizonte
+            mins = max(float(horizon_min or sig.time_stop_min or 20), 1.0)
+            frac_session = mins / (_SESSION_HOURS * 60.0)
+            T_years = frac_session / _TRADING_DAYS_YEAR
+            sigma_h = realized_vol * math.sqrt(max(T_years, 1e-9))
+            min_dist_rel = min(stop_dist, target_dist) / spot
+            # feasibility: probabilidad de que el spot toque alguna barrera en T
+            feas = 2.0 * (1.0 - float(norm.cdf(min_dist_rel / max(sigma_h, 1e-6))))
+            feas = min(max(feas, 0.0), 1.0)
+            base = naive * feas + 0.5 * (1.0 - feas)
+        else:
+            base = naive
 
     score_boost = max(min((sig.score - 52.0) * 0.0035, 0.09), -0.07)
     structure_boost = 0.0
@@ -654,16 +835,22 @@ def _estimate_long_pop(sig: ScalpSignal, g: OptionGreeks, snap) -> float:
 
 
 def _estimate_trade_ev(sig: ScalpSignal) -> tuple[float, float, float]:
-    """EV, friccion y friccion porcentual por lote, neto de costos modelados."""
+    """EV, friccion y friccion porcentual por lote, neto de costos modelados.
+
+    Importante: plan_entry ya incluye half_spread*aggression sobre el mid (BUY) o
+    media debajo del mid (SELL), por lo que el costo del spread ya esta dentro
+    del precio de entrada. No volver a restarlo del reward (doble conteo).
+    """
     friction = max(sig.fees_ars + sig.spread_cost_ars, 0.0)
     notional = max(sig.plan_entry * 100.0, 0.01)
     friction_pct = friction / notional * 100.0
 
     if sig.action.startswith("BUY_"):
-        reward = max((sig.plan_tp - sig.plan_entry) * 100.0 - sig.fees_ars - sig.spread_cost_ars, 0.0)
+        # reward neto solo de fees de cierre (las de entrada ya estan en planned_risk)
+        reward = max((sig.plan_tp - sig.plan_entry) * 100.0 - sig.fees_ars, 0.0)
         risk = max(sig.planned_risk_ars, 0.0)
     else:
-        reward = max((sig.plan_entry - sig.plan_tp) * 100.0 - sig.fees_ars - sig.spread_cost_ars, 0.0)
+        reward = max((sig.plan_entry - sig.plan_tp) * 100.0 - sig.fees_ars, 0.0)
         risk = max(sig.planned_risk_ars, 0.0)
 
     ev = sig.probability_of_profit * reward - (1.0 - sig.probability_of_profit) * risk
@@ -705,7 +892,8 @@ def _cost_to_target_pct(sig: ScalpSignal) -> float:
     return round(max(sig.friction_ars, 0.0) / gross_target * 100.0, 2)
 
 
-def _current_session_phase() -> str:
+def _current_session_phase(eod_window_min: int = 35) -> str:
+    """Fase de la sesion BYMA. "close" abarca los ultimos eod_window_min minutos."""
     now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
     if now.weekday() >= 5:
         return "closed"
@@ -714,9 +902,32 @@ def _current_session_phase() -> str:
         return "closed"
     if t < dt_time(11, 20):
         return "open"
-    if t >= dt_time(16, 45):
+    close_dt = datetime.combine(now.date(), dt_time(17, 0))
+    eod_start = (close_dt - timedelta(minutes=max(int(eod_window_min), 5))).time()
+    if t >= eod_start:
         return "close"
     return "regular"
+
+
+def _overnight_overrides(cfg: dict[str, float]) -> dict[str, float]:
+    """Ajustes del cfg para modo EOD/overnight.
+
+    - DTE minimo 5 (theta overnight tolerable) -> aplicado en filtros del scanner.
+    - Sizing al 50% del risk_per_trade.
+    - entry_aggression mas baja (no perseguir punta sobre el cierre).
+    - max_breakeven_move_pct mas estricto (gap risk).
+    - min_pop mas alto.
+    """
+    overnight = dict(cfg)
+    overnight["entry_aggression"] = min(float(cfg.get("entry_aggression", 0.35)) * 0.6, 0.25)
+    overnight["max_breakeven_move_pct"] = float(cfg.get("max_breakeven_move_pct", 0.65)) * 0.7
+    overnight["min_pop"] = max(float(cfg.get("min_pop", 0.52)), 0.55)
+    overnight["min_action_delta"] = max(float(cfg.get("min_action_delta", 0.25)), 0.35)
+    overnight["max_action_moneyness"] = min(float(cfg.get("max_action_moneyness", 14.0)), 8.0)
+    overnight["overnight_mode"] = True
+    overnight["overnight_min_dte"] = 5
+    overnight["overnight_sizing_factor"] = 0.5
+    return overnight
 
 
 def _is_hard_flag(flag: str) -> bool:
@@ -738,6 +949,10 @@ def _is_hard_flag(flag: str) -> bool:
         "delta_baja",
         "strike_lejano",
         "stop_dentro_spread",
+        "iv_barata_no_direccional",
+        "venta_iv_solo_contexto",
+        "sin_confirmacion_intradia_live",
+        "pulso_live_",
     )
     return flag.startswith(hard_prefixes)
 
@@ -760,6 +975,7 @@ def _finalize_as_watchlist(
     positions: Optional[list],
     profile_cfg: dict[str, float],
     flags: list[str],
+    realized_vol: Optional[float] = None,
 ) -> ScalpSignal:
     sig = _finalize_signal(
         sig,
@@ -768,6 +984,7 @@ def _finalize_as_watchlist(
         capital=capital,
         positions=positions,
         profile_cfg=profile_cfg,
+        realized_vol=realized_vol,
     )
     return _add_watch_flags(sig, *flags)
 
@@ -779,6 +996,7 @@ def _finalize_signal(
     capital: Optional[float],
     positions: Optional[list],
     profile_cfg: Optional[dict[str, float]] = None,
+    realized_vol: Optional[float] = None,
 ) -> ScalpSignal:
     cfg = profile_cfg or _PROFILE_CFG["balanced"]
     plan = _trade_plan_detail(g, sig.action, snap, playbook=sig.playbook, profile_cfg=cfg)
@@ -788,20 +1006,26 @@ def _finalize_signal(
     sig.plan_rr = float(plan["rr"])
     sig.planned_risk_ars = float(plan["planned_risk_ars"])
     sig.max_loss_ars = float(plan["max_loss_ars"])
+    _ml_unc = plan.get("max_loss_uncapped_ars", plan["max_loss_ars"])
+    sig.max_loss_uncapped_ars = float(_ml_unc) if not (isinstance(_ml_unc, float) and math.isinf(_ml_unc)) else float("inf")
     sig.fees_ars = float(plan["fees_ars"])
     sig.spread_cost_ars = float(plan["spread_cost_ars"])
     sig.breakeven_move_pct = float(plan["breakeven_move_pct"])
     sig.underlying_stop = float(plan["underlying_stop"])
     sig.underlying_target = float(plan["underlying_target"])
     sig.entry_style = str(plan["entry_style"])
-    sig.probability_of_profit = _estimate_long_pop(sig, g, snap)
+    sig.time_stop_min = int(cfg.get("time_stop_min", 20))
+    sig.probability_of_profit = _estimate_long_pop(
+        sig, g, snap, realized_vol=realized_vol, horizon_min=sig.time_stop_min,
+    )
     sig.expected_value_ars, sig.friction_ars, sig.friction_pct = _estimate_trade_ev(sig)
     sig.edge_r = round(sig.expected_value_ars / max(sig.planned_risk_ars, 0.01), 4)
     sig.fill_probability = _fill_probability(g, sig, cfg)
     sig.cost_to_target_pct = _cost_to_target_pct(sig)
     sig.microstructure_bias = _microstructure_bias(g)
-    sig.session_phase = _current_session_phase()
-    sig.time_stop_min = int(cfg.get("time_stop_min", 20))
+    sig.session_phase = _current_session_phase(
+        eod_window_min=int(getattr(settings, "scalping_eod_window_min", 35))
+    )
 
     flags = _risk_flags_for_signal(
         g,
@@ -833,8 +1057,26 @@ def _finalize_signal(
     if sig.score < min_score:
         flags.append(f"score<{min_score:.0f}")
     flags.extend(_session_flags(cfg))
+    if cfg.get("require_live_confirmation"):
+        live_direction = str(cfg.get("live_direction", "NEUTRAL") or "NEUTRAL").upper()
+        if not cfg.get("live_confirmation"):
+            flags.append("sin_confirmacion_intradia_live")
+        elif sig.action == "BUY_CALL" and live_direction != "BULL":
+            flags.append("pulso_live_no_alcista")
+        elif sig.action == "BUY_PUT" and live_direction != "BEAR":
+            flags.append("pulso_live_no_bajista")
+
+    # Modo overnight: filtros adicionales y sizing reducido
+    if cfg.get("overnight_mode"):
+        min_dte = int(cfg.get("overnight_min_dte", 5))
+        if sig.days_to_expiry < min_dte:
+            flags.append(f"overnight_dte<{min_dte}")
+        flags.append("setup_overnight")
 
     sig.suggested_lots = _risk_to_lots(capital, sig.planned_risk_ars)
+    if cfg.get("overnight_mode") and sig.suggested_lots > 0:
+        size_factor = float(cfg.get("overnight_sizing_factor", 0.5))
+        sig.suggested_lots = max(int(sig.suggested_lots * size_factor), 1)
     if capital is not None and capital > 0 and sig.suggested_lots <= 0:
         flags.append("capital_insuficiente")
     if cfg.get("require_capital") and (capital is None or capital <= 0):
@@ -867,6 +1109,7 @@ def scan_momentum(
     capital: Optional[float] = None,
     positions: Optional[list] = None,
     profile_cfg: Optional[dict[str, float]] = None,
+    realized_vol: Optional[float] = None,
 ) -> list[ScalpSignal]:
     if snap is None:
         return []
@@ -941,10 +1184,10 @@ def scan_momentum(
             expected_move="continuacion alcista" if is_bullish else "continuacion bajista",
         )
         signals.append(
-            _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=profile_cfg)
+            _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=profile_cfg, realized_vol=realized_vol)
         )
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:10]
 
 
@@ -955,6 +1198,7 @@ def scan_wave_ride(
     capital: Optional[float] = None,
     positions: Optional[list] = None,
     profile_cfg: Optional[dict[str, float]] = None,
+    realized_vol: Optional[float] = None,
 ) -> list[ScalpSignal]:
     """Sigue la ola: compra gamma en la direccion del impulso confirmado."""
     if snap is None:
@@ -1020,10 +1264,10 @@ def scan_wave_ride(
             trigger="Momentum + estructura/volumen",
             expected_move="continuacion alcista" if bias == "BULL" else "continuacion bajista",
         )
-        finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg)
+        finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg, realized_vol=realized_vol)
         signals.append(_add_watch_flags(finalized, *flags))
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:10]
 
 
@@ -1033,6 +1277,7 @@ def scan_rebound(
     capital: Optional[float] = None,
     positions: Optional[list] = None,
     profile_cfg: Optional[dict[str, float]] = None,
+    realized_vol: Optional[float] = None,
 ) -> list[ScalpSignal]:
     """Pricea rebotes: giro desde RSI extremo, CHoCH u order block cercano."""
     if snap is None:
@@ -1112,10 +1357,10 @@ def scan_rebound(
                 trigger="RSI extremo / CHoCH / zona",
                 expected_move="rebote alcista" if side == "BULL" else "rebote bajista",
             )
-            finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg)
+            finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg, realized_vol=realized_vol)
             signals.append(_add_watch_flags(finalized, *flags))
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:10]
 
 
@@ -1146,11 +1391,10 @@ def scan_volatility_breakout(
         opt_type, action = _side_action(side)
         structure_ok = _structure_confirms(snap, side)
         for g in _movement_pool(greeks, opt_type, max_days=25, min_delta=0.20, max_abs_moneyness=14.0):
-            vol_edge = (realized_vol - g.iv) if realized_vol and g.iv else 0.0
+            # vol_edge no es info direccional -> no sumar al breakout score (IV barata != alcista/bajista)
             breakout_score = min(abs(mom) * 2.0, 10.0) + min(atr_pct * 1.5, 8.0)
             breakout_score += 4.0 if vol_ok else 0.0
             breakout_score += 5.0 if structure_ok else 0.0
-            breakout_score += min(max(vol_edge, 0.0) * 100.0, 5.0)
             score = max(0.0, min(100.0, _option_movement_score(g, cfg) + breakout_score))
 
             flags: list[str] = []
@@ -1187,10 +1431,10 @@ def scan_volatility_breakout(
                 trigger="Expansion de rango o volumen",
                 expected_move="breakout alcista" if side == "BULL" else "breakout bajista",
             )
-            finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg)
+            finalized = _finalize_signal(sig, g, snap=snap, capital=capital, positions=positions, profile_cfg=cfg, realized_vol=realized_vol)
             signals.append(_add_watch_flags(finalized, *flags))
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:12]
 
 
@@ -1203,6 +1447,7 @@ def scan_iv_spike(
     capital: Optional[float] = None,
     positions: Optional[list] = None,
     profile_cfg: Optional[dict[str, float]] = None,
+    realized_vol: Optional[float] = None,
 ) -> list[ScalpSignal]:
     if smile_map is None or not smile_map or spot <= 0:
         return []
@@ -1273,10 +1518,11 @@ def scan_iv_spike(
             capital=capital,
             positions=positions,
             profile_cfg=profile_cfg,
+            realized_vol=realized_vol,
         )
         signals.append(_add_watch_flags(finalized, "venta_iv_solo_contexto"))
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:10]
 
 
@@ -1351,10 +1597,11 @@ def scan_gamma_scalp(
             capital=capital,
             positions=positions,
             profile_cfg=profile_cfg,
+            realized_vol=realized_vol,
         )
         signals.append(_add_watch_flags(finalized, *_context_watch_flags(g, snap, realized_vol)))
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:10]
 
 
@@ -1438,10 +1685,10 @@ def scan_gamma_radar(
             expected_move="esperando trigger",
         )
         signals.append(
-            _finalize_as_watchlist(sig, g, snap, capital, positions, cfg, flags)
+            _finalize_as_watchlist(sig, g, snap, capital, positions, cfg, flags, realized_vol=realized_vol)
         )
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:16]
 
 
@@ -1488,10 +1735,12 @@ def scan_chain_iv_relative(
                 edge_source = f"IV cara vs cadena +{edge_pp:.1f}pp"
                 extra_flags = ["confirmar_con_smile_iv"]
             else:
+                # IV barata NO es senal direccional - solo radar de vigilancia
                 action = "BUY_CALL" if g.option_type == "C" else "BUY_PUT"
                 signal_type = "IV_CHEAP_CHAIN"
                 edge_source = f"IV barata vs cadena {edge_pp:.1f}pp"
                 extra_flags = _context_watch_flags(g, snap, realized_vol=realized_vol)
+                extra_flags.append("iv_barata_no_direccional")
                 extra_flags.append("confirmar_breakout")
 
             iv_score = min(abs(edge_pp) * 5.0, 42.0)
@@ -1529,10 +1778,10 @@ def scan_chain_iv_relative(
                 expected_move="solo watchlist para scalping direccional" if is_rich else "breakout a confirmar",
             )
             signals.append(
-                _finalize_as_watchlist(sig, g, snap, capital, positions, cfg, extra_flags)
+                _finalize_as_watchlist(sig, g, snap, capital, positions, cfg, extra_flags, realized_vol=realized_vol)
             )
 
-    signals.sort(key=lambda s: s.score, reverse=True)
+    signals.sort(key=_signal_rank, reverse=True)
     return signals[:12]
 
 
@@ -1546,6 +1795,10 @@ def scan_all(
     capital: Optional[float] = None,
     positions: Optional[list] = None,
     risk_profile: str = "balanced",
+    allow_overnight_entries: bool = False,
+    require_live_confirmation: bool = False,
+    live_confirmation: bool = False,
+    live_direction: str = "NEUTRAL",
 ) -> tuple[dict[str, OptionGreeks], list[ScalpSignal]]:
     profile_key = str(risk_profile or "balanced").lower()
     cfg = dict(_PROFILE_CFG.get(profile_key, _PROFILE_CFG["balanced"]))
@@ -1555,6 +1808,16 @@ def scan_all(
     cfg["max_total_risk_pct"] = settings.scalping_max_total_risk_pct
     cfg["time_stop_min"] = settings.scalping_no_progress_min
     cfg["flat_before_close_min"] = settings.scalping_flat_before_close_min
+    cfg["require_live_confirmation"] = require_live_confirmation
+    cfg["live_confirmation"] = live_confirmation
+    cfg["live_direction"] = str(live_direction or "NEUTRAL").upper()
+
+    # Overnight es una estrategia explicita. El scanner intradia no cambia de
+    # mandato automaticamente cerca del cierre.
+    eod_window = int(getattr(settings, "scalping_eod_window_min", 35))
+    phase = _current_session_phase(eod_window_min=eod_window)
+    if phase == "close" and allow_overnight_entries:
+        cfg = _overnight_overrides(cfg)
 
     greeks = compute_chain_greeks(chain, expiry_calendar, r=r)
     if not greeks:
@@ -1571,6 +1834,7 @@ def scan_all(
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
+            realized_vol=realized_vol,
         )
     )
     all_signals.extend(
@@ -1580,6 +1844,7 @@ def scan_all(
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
+            realized_vol=realized_vol,
         )
     )
     all_signals.extend(
@@ -1600,6 +1865,7 @@ def scan_all(
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
+            realized_vol=realized_vol,
         )
     )
     all_signals.extend(
@@ -1612,6 +1878,7 @@ def scan_all(
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
+            realized_vol=realized_vol,
         )
     )
     all_signals.extend(

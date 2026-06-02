@@ -1,11 +1,16 @@
 """Tests de las señales de gestión activa (signals/management.py)."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
-from optionsdesk.signals.management import ManagementSignal, SignalType, evaluate_position
+from optionsdesk.signals.management import (
+    ManagementSignal,
+    SignalType,
+    evaluate_position,
+    evaluate_scalp_quote_position,
+)
 from optionsdesk.signals.monitor import OpenPosition
 
 
@@ -211,6 +216,62 @@ def test_long_scalp_take_profit_and_stop(monkeypatch):
     assert evaluate_position(pos, current_spot=9000.0).signal_type == SignalType.STOP
 
 
+def test_scalp_quote_plan_uses_executable_price_and_time_stop():
+    pos = _make_pos(strategy="SCALP_LONG_CALL", premium_received=-100.0)
+    pos.net_outlay = 100.0
+    pos.scalp_plan_entry = 100.0
+    pos.scalp_plan_sl = 80.0
+    pos.scalp_plan_tp = 130.0
+    pos.scalp_time_stop_min = 20
+    pos.opened_at = datetime(2026, 6, 1, 12, 0)
+
+    assert evaluate_scalp_quote_position(pos, 131.0).signal_type == SignalType.TAKE_PROFIT
+    assert evaluate_scalp_quote_position(pos, 79.0).signal_type == SignalType.STOP
+    assert (
+        evaluate_scalp_quote_position(pos, 105.0, now=datetime(2026, 6, 1, 12, 21)).signal_type
+        == SignalType.TIME_STOP
+    )
+    assert (
+        evaluate_scalp_quote_position(pos, 105.0, now=datetime(2026, 6, 1, 12, 10)).signal_type
+        == SignalType.HOLD
+    )
+
+
+def test_short_scalp_quote_plan_inverts_exit_levels():
+    pos = _make_pos(strategy="SCALP_SHORT_CALL", premium_received=100.0)
+    pos.scalp_plan_entry = 100.0
+    pos.scalp_plan_sl = 125.0
+    pos.scalp_plan_tp = 70.0
+
+    assert evaluate_scalp_quote_position(pos, 69.0).signal_type == SignalType.TAKE_PROFIT
+    assert evaluate_scalp_quote_position(pos, 126.0).signal_type == SignalType.STOP
+
+
+def test_intraday_scalp_gets_preventive_session_close_signal():
+    pos = _make_pos(strategy="SCALP_LONG_CALL", premium_received=-100.0)
+    pos.net_outlay = 100.0
+    pos.scalp_plan_entry = 100.0
+    pos.scalp_plan_sl = 80.0
+    pos.scalp_plan_tp = 130.0
+
+    signal = evaluate_scalp_quote_position(pos, 105.0, now=datetime(2026, 6, 1, 16, 51))
+
+    assert signal.signal_type == SignalType.SESSION_CLOSE
+
+
+def test_explicit_overnight_scalp_skips_preventive_session_close():
+    pos = _make_pos(strategy="SCALP_LONG_CALL", premium_received=-100.0)
+    pos.net_outlay = 100.0
+    pos.scalp_plan_entry = 100.0
+    pos.scalp_plan_sl = 80.0
+    pos.scalp_plan_tp = 130.0
+    pos.scalp_allow_overnight = True
+
+    signal = evaluate_scalp_quote_position(pos, 105.0, now=datetime(2026, 6, 1, 16, 51))
+
+    assert signal.signal_type == SignalType.HOLD
+
+
 # ── Retrocompatibilidad from_dict ─────────────────────────────────────────────
 
 def test_from_dict_defaults_new_fields():
@@ -256,3 +317,29 @@ def test_from_dict_reads_new_fields():
     assert pos.max_loss_mult == pytest.approx(3.0)
     assert pos.roll_dte == 14
     assert pos.defend_delta == pytest.approx(0.45)
+
+
+def test_from_dict_reads_intraday_plan():
+    d = {
+        "symbol": "GFGC9000F",
+        "strategy": "SCALP_LONG_CALL",
+        "strike": 9000.0,
+        "spot_entry": 8500.0,
+        "premium_received": -100.0,
+        "net_outlay": 100.0,
+        "iv_entry": 0.55,
+        "days_entry": 30,
+        "entry_date": date.today().isoformat(),
+        "opened_at": "2026-06-01T12:00:00",
+        "target_exit_days": 1,
+        "target_capture_pct": 30.0,
+        "scalp_plan_entry": 100.0,
+        "scalp_plan_sl": 80.0,
+        "scalp_plan_tp": 130.0,
+        "scalp_time_stop_min": 20,
+    }
+    pos = OpenPosition.from_dict(d)
+    assert pos.opened_at == datetime(2026, 6, 1, 12, 0)
+    assert pos.scalp_plan_sl == pytest.approx(80.0)
+    assert pos.scalp_plan_tp == pytest.approx(130.0)
+    assert pos.scalp_time_stop_min == 20

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -47,6 +47,7 @@ class OptionsChain:
     spot: Quote
     options: dict[str, Quote]
     timestamp: datetime = field(default_factory=datetime.now)
+    expiry_calendar: dict[str, date] = field(default_factory=dict)
 
 
 @dataclass
