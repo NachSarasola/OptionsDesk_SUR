@@ -9,7 +9,6 @@ import logging
 import math
 import random
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,15 @@ class DemoProvider(MarketDataProvider):
         self._drift += random.gauss(0, self._spot * 0.002)
         s = self._spot + self._drift
         return _gen_quote("GGAL", s, spread_frac=0.002)
+
+    def get_quote(self, symbol: str) -> Quote:
+        symbol = str(symbol or "GGAL").upper().strip()
+        if symbol == "GGAL":
+            return self.get_spot()
+        seed = sum(ord(ch) for ch in symbol)
+        base = max(800.0 + (seed % 90) * 75.0, 100.0)
+        drift = random.gauss(0, base * 0.006)
+        return _gen_quote(symbol, base + drift, spread_frac=0.006)
 
     def get_caucion_tna(self, days: int = 30) -> float:
         return self._caucion_tna + random.gauss(0, 0.3)

@@ -12,4 +12,11 @@ env/
 *.parquet
 data/snapshots/
 data/paper_orders.jsonl
+data/closed_positions.jsonl
+data/recorder_status.json
+data/spot_tape.jsonl
+data/stock_demo_positions.json
+data/stock_demo_trades.jsonl
+data/stock_tape/
+.playwright-mcp/
 .mypy_cache/

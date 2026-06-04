@@ -1,6 +1,6 @@
 """Detector de oportunidades intradía en la cadena de opciones GGAL.
 
-Lee los snapshots del recorder (~120s de granularidad) y separa los movimientos
+Lee los snapshots del recorder (15s por default) y separa los movimientos
 de prima impulsados por IV (edge real para el vendedor) de los explicados por
 el delta (movimiento del subyacente).
 
@@ -14,7 +14,7 @@ Un z-score alto del residual IV → la prima subió "más de lo que el spot expl
 brusca del residual → la prima se desplomó → cerrar rápido (CLOSE).
 
 Limitaciones honestas (visibles en la UI):
-    - BYMA Open Data demora ~15-20 min → no es real-time, sino swing intradía.
+    - Primary permite streaming; IOL REST usa frecuencia acotada; BYMA Open Data queda demorado.
     - Liquidez fina en opciones GGAL → un único print puede generar falsas señales.
     - Solo funciona con el recorder corriendo.
 """
@@ -24,9 +24,8 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
-import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
@@ -203,8 +202,11 @@ def detect_write_opportunities(
             continue
 
         # Delta serie — puede estar ausente o ser NaN
-        delta_col = grp["delta"] if "delta" in grp.columns else pd.Series(dtype=float)
-        delta_series = delta_col.reindex(mids.index).fillna(0.0)
+        if "delta" not in grp.columns:
+            continue
+        delta_series = pd.to_numeric(grp["delta"], errors="coerce").reindex(mids.index)
+        if delta_series.isna().any():
+            continue
 
         # Spot alineado al mismo índice
         spot_aligned = spot_series.reindex(mids.index, method="nearest").ffill()
@@ -226,6 +228,11 @@ def detect_write_opportunities(
 
         if last_z >= zscore_threshold and change_pct > 0:
             opt_type = "C" if "C" in str(symbol).upper() else "P"
+            elapsed_min = (
+                (mids.index[-1] - mids.index[-(window + 1)]).total_seconds() / 60.0
+                if len(mids) >= window + 1
+                else 0.0
+            )
             signals.append(IntradaySignal(
                 signal_type="WRITE",
                 symbol=str(symbol),
@@ -234,7 +241,7 @@ def detect_write_opportunities(
                 premium_change_pct=change_pct,
                 iv_residual_z=last_z,
                 message=(
-                    f"Prima subió {change_pct:+.1f}% — componente IV z={last_z:.1f} "
+                    f"Prima subio {change_pct:+.1f}% en {elapsed_min:.0f} min - componente IV z={last_z:.1f} "
                     f"(vs umbral {zscore_threshold:.1f}). "
                     "La prima luce rica; ventana para lanzar. "
                     "Verificá liquidez antes de operar."
@@ -289,6 +296,9 @@ def detect_close_opportunities(
                 if pos.premium_received > 0 else 0.0
             )
             opt_type = pos.opt_type
+            elapsed_min = (
+                (series.index[-1] - series.index[-(window + 1)]).total_seconds() / 60.0
+            )
             signals.append(IntradaySignal(
                 signal_type="CLOSE",
                 symbol=symbol,
@@ -297,7 +307,7 @@ def detect_close_opportunities(
                 premium_change_pct=change_pct,
                 iv_residual_z=0.0,   # no descomponemos para cierre — la caída sola alcanza
                 message=(
-                    f"Prima cayó {change_pct:.1f}% en los últimos ~{window * 2} min. "
+                    f"Prima cayo {change_pct:.1f}% en los ultimos {elapsed_min:.0f} min. "
                     f"Captura estimada: {captured:.0f}% de la prima original. "
                     "Considerar cierre anticipado para asegurar la ganancia."
                 ),

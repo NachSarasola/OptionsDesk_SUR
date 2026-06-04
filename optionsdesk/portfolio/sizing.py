@@ -12,7 +12,7 @@ binaria y el Kelly standard sobreestima el leverage óptimo.
 from __future__ import annotations
 
 import math
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from optionsdesk.signals.recommender import Recommendation
@@ -24,7 +24,7 @@ _DEFAULT_KELLY_FRACTION = 0.25
 _MAX_CAPITAL_PER_TRADE_PCT = 0.20
 
 # Mínimo: siempre al menos 1 contrato
-_MIN_CONTRACTS = 1
+_MIN_CONTRACTS = 0
 
 
 def kelly_fraction(

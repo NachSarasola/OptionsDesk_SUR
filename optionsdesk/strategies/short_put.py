@@ -56,7 +56,7 @@ class ShortPutScanner(Strategy):
         effective_calendar = merge_expiry_calendars(self._expiry_cal, chain.expiry_calendar)
 
         for sym, quote in chain.options.items():
-            contract = parse_option_symbol(sym, effective_calendar)
+            contract = parse_option_symbol(sym, effective_calendar, spot_hint=S)
             if contract is None or contract.option_type != OptionType.PUT:
                 continue
 

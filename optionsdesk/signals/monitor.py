@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 from optionsdesk.core.pricing import crr_price
+from optionsdesk.config.costs import DEFAULT_COSTS
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,39 @@ _CRR_STEPS = 50
 
 def _optional_float(value) -> Optional[float]:
     return float(value) if value not in (None, "") else None
+
+
+def _realized_pnl_on_close(record: dict, exit_price: Optional[float]) -> Optional[float]:
+    """P&L realizado al cerrar el leg de la opción (recompra/venta).
+
+    - Long (scalp comprado): (salida − entrada) × 100 × lotes − costos.
+    - Short premium (renta covered call / short put, scalp vendido): captura de
+      prima = (prima_cobrada − recompra) × 100 × lotes − costos. Para el covered
+      call mide la pata de la opción (la prima) — que es el edge VRP a calibrar;
+      la pata de acción es beta separada.
+    Devuelve None si falta exit_price o la referencia de entrada (no inventa).
+    """
+    if exit_price is None or exit_price <= 0:
+        return None
+    strat = str(record.get("strategy", "")).upper()
+    qty = int(record.get("contracts") or 1)
+    is_long = "LONG" in strat or "BUY_CALL" in strat or "BUY_PUT" in strat
+    entry_px = float(
+        (record.get("scalp_plan_entry") if "SCALP" in strat else record.get("premium_received")) or 0.0
+    )
+    if entry_px <= 0:
+        return None
+    if is_long:
+        gross = (exit_price - entry_px) * qty * 100.0
+        entry_side, exit_side = "option_buy", "option_sell"
+    else:
+        gross = (entry_px - exit_price) * qty * 100.0
+        entry_side, exit_side = "option_sell", "option_buy"
+    fees = (
+        DEFAULT_COSTS.gross_cost(entry_px * qty * 100.0, entry_side)
+        + DEFAULT_COSTS.gross_cost(exit_price * qty * 100.0, exit_side)
+    )
+    return round(gross - fees, 2)
 
 
 @dataclass
@@ -65,6 +99,9 @@ class OpenPosition:
     defend_delta: float = 0.50   # señal de defensa cuando |delta| ≥ defend_delta
     # Cantidad de contratos abiertos (v3.1) — default 1 para retrocompatibilidad
     contracts: int = 1
+    # Predicción al abrir (para calibrar el edge de renta: esperado vs realizado).
+    expected_pop: Optional[float] = None         # PoP física al entrar (0..1)
+    expected_ev_ars: Optional[float] = None       # EV esperado por lote al entrar
     # Plan intradia opcional. Se conserva separado de la gestion swing por CRR.
     opened_at: Optional[datetime] = None
     scalp_plan_entry: Optional[float] = None
@@ -98,6 +135,8 @@ class OpenPosition:
             roll_dte=int(d.get("roll_dte", 21)),
             defend_delta=float(d.get("defend_delta", 0.50)),
             contracts=int(d.get("contracts", 1)),
+            expected_pop=_optional_float(d.get("expected_pop")),
+            expected_ev_ars=_optional_float(d.get("expected_ev_ars")),
             opened_at=datetime.fromisoformat(d["opened_at"]) if d.get("opened_at") else None,
             scalp_plan_entry=_optional_float(d.get("scalp_plan_entry")),
             scalp_plan_sl=_optional_float(d.get("scalp_plan_sl")),
@@ -158,33 +197,62 @@ class PositionMonitor:
                     logger.warning("Línea inválida en posiciones: %.60s — %s", line, exc)
         return positions
 
-    def remove_position_at(self, index: int) -> bool:
-        """Elimina una posicion local por indice sin descartar lineas desconocidas."""
+    def close_position_at(
+        self,
+        index: int,
+        *,
+        reason: str = "manual_local_close",
+        exit_price: Optional[float] = None,
+    ) -> bool:
+        """Archiva y elimina una posicion local. Nunca envia una orden al mercado."""
         if index < 0 or not self._file.exists():
             return False
 
         retained: list[str] = []
         valid_index = -1
         removed = False
+        closed_record: Optional[dict] = None
         for raw_line in self._file.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             try:
-                OpenPosition.from_dict(json.loads(line))
+                record = json.loads(line)
+                OpenPosition.from_dict(record)
                 valid_index += 1
             except (KeyError, ValueError):
                 retained.append(raw_line)
                 continue
             if valid_index == index:
                 removed = True
+                realized_pnl = _realized_pnl_on_close(record, exit_price)
+                closed_record = {
+                    **record,
+                    "closed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "close_reason": reason,
+                    "exit_price": exit_price,
+                    "realized_pnl_ars": realized_pnl,
+                    "market_order_sent": False,
+                }
                 continue
             retained.append(raw_line)
 
-        if removed:
+        if removed and closed_record is not None:
+            archive = self._file.with_name("closed_positions.jsonl")
+            with archive.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(closed_record, ensure_ascii=False) + "\n")
             payload = "\n".join(retained)
             self._file.write_text(payload + ("\n" if payload else ""), encoding="utf-8")
+            try:
+                from optionsdesk.signals.scalp_tickets import invalidate_manual_reconciliation
+                invalidate_manual_reconciliation()
+            except Exception:
+                pass
         return removed
+
+    def remove_position_at(self, index: int) -> bool:
+        """Compatibilidad: archiva el cierre local antes de quitar la posicion."""
+        return self.close_position_at(index)
 
     def compute_capture(
         self,

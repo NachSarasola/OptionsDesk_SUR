@@ -90,7 +90,7 @@ class TelegramAlerter:
             f"Captura actual: <b>{capture_pct:.1f}%</b> "
             f"(objetivo: {target_pct:.0f}%)\n"
             f"Días en posición: {days_held}\n"
-            f"<i>Revisá la posición y ejecutá el cierre en Bull Market.</i>"
+            f"<i>Revisá la posición y ejecutá el cierre manualmente en Matriz.</i>"
         )
         return self._send(text)
 
@@ -138,7 +138,6 @@ class TelegramAlerter:
 
     def send_recommendation(self, rec: "Recommendation") -> bool:  # noqa: F821
         """Envía la recomendacion de un perfil por Telegram."""
-        from optionsdesk.signals.recommender import Recommendation  # local para evitar ciclo
         strat = (
             "Lanzamiento cubierto"
             if rec.result.strategy == "COVERED_CALL"

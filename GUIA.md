@@ -4,17 +4,17 @@
 
 El bot analiza todas las opciones disponibles de GGAL en BYMA, calcula la tasa anualizada que podes cobrar con dos estrategias (lanzamiento cubierto y venta de put), y te muestra **la mejor jugada para cada perfil de riesgo**.
 
-No necesitas saber teoria de opciones. Solo lees la tarjeta verde, aprietas "Generar ticket" y pegas la orden en Bull Market.
+No necesitas saber teoria de opciones. Lees la tarjeta verde, aprietas "Generar ticket" y cargas la orden manualmente en Matriz.
 
 ---
 
 ## Como usarlo (5 pasos)
 
-1. **Abre el dashboard** con `streamlit run optionsdesk/ui/dashboard.py`
+1. **Abre el dashboard** con `streamlit run app.py`
 2. **Mira la tab "Inicio"** — ves tres tarjetas: Conservadora, Equilibrada y Agresiva
 3. **Elige la tarjeta que te convence** — el semaforo verde significa que paso todos los filtros de riesgo
 4. **Haz clic en "Generar ticket"** — te aparece el texto exacto de la orden para copiar
-5. **Pega la orden en Bull Market** — ejecutas vos manualmente; el bot no opera solo
+5. **Carga la orden en Matriz** — ejecutas vos manualmente; el bot no opera solo
 
 **Sidebar:**
 - *Capital disponible*: ingresa cuanto tenes en pesos → el bot calcula cuantos lotes entras y la ganancia estimada
@@ -64,7 +64,7 @@ El bot analiza automaticamente si conviene esperar al vencimiento o cerrar la po
 
 **Como ejecutar el swing:**
 1. El badge dice "SWING — cerra en ~12 dias".
-2. Cuando llega ese dia (o antes si el mercado se mueve a tu favor), entras a Bull Market.
+2. Cuando llega ese dia (o antes si el mercado se mueve a tu favor), entras a Matriz.
 3. Buscas la posicion y ejecutas la recompra de la opcion al precio de mercado.
 4. Si configuraste el monitor (`HORIZON_MONITOR_ENABLED=true`), recibis una alerta de Telegram en el momento exacto en que se alcanza el % de captura objetivo.
 
@@ -311,7 +311,7 @@ El tab **Oportunidades** tiene un panel "Intraday — spikes de prima" que detec
 
 ### Como funciona
 
-El bot lee los snapshots del recorder (~120s de granularidad) y descompone cada cambio de prima en:
+El bot lee los snapshots del recorder y descompone cada cambio de prima en:
 
 ```
 Δprima_total = Δprima_delta + Δprima_IV
@@ -321,18 +321,112 @@ El bot lee los snapshots del recorder (~120s de granularidad) y descompone cada 
 
 Un z-score alto del residual IV = prima se encarecio mas alla de lo que justifica el subyacente → buena ventana para vender.
 
+En la mesa de scalping, el panel consulta la cadena viva cada 5s cuando usa Primary
+WebSocket. IOL REST usa 60s por default en el dashboard, consulta
+un radar ATM acotado y aplica un piso de 900s en el recorder para cuidar el cupo
+mensual de API calls. Primary WebSocket
+es la fuente recomendada para señales intradia de mayor frecuencia.
+
+El recorder guarda GGAL cada 60s en `data/spot_tape.jsonl`. El grafico puede
+reconstruir el tape observado de la rueda aun si recargas el dashboard. El
+gatillo de momentum usa deliberadamente solo los ultimos 10 minutos: una rueda
+completa sirve como contexto, pero diluiria un giro intradia reciente.
+
 ### Limitaciones honestas
 
-- BYMA Open Data demora **~15-20 min** → no es scalping milisegundos, es swing intradiario.
+- Primary WebSocket permite streaming realtime. IOL REST queda operativo con frecuencia acotada. BYMA Open Data demora **~15-20 min** y solo sirve como fallback de referencia.
 - La liquidez de opciones GGAL intradiaria es **fina** → un unico print puede generar una falsa señal. Siempre verificar bid-ask antes de operar.
 - Solo funciona si el **recorder esta corriendo** ese dia.
 
 ---
 
+## Datos realtime con Primary / Matriz OMS
+
+OptionsDesk prioriza Primary WebSocket cuando estan configuradas estas variables:
+
+```ini
+PRIMARY_BASE_URL=https://api.remarkets.primary.com.ar
+PRIMARY_USER=tu_usuario
+PRIMARY_PASSWORD=tu_password
+```
+
+`PRIMARY_BASE_URL` depende del ALyC en produccion. Para pruebas, reMarkets ofrece
+credenciales gratuitas. El provider autentica por REST, descubre el spot `GGAL`
+y las opciones `GFGC` / `GFGV`, y luego mantiene la cadena por WebSocket.
+
+Variables opcionales para instalaciones particulares:
+
+```ini
+PRIMARY_WS_URL=
+PRIMARY_SPOT_SYMBOL=
+PRIMARY_CAUCION_SYMBOL=
+```
+
+Si Primary no esta configurado, el orden de fallback es IOL REST y BYMA Open
+Data. El dashboard sigue siendo read-only: genera tickets paper y la
+orden real se confirma manualmente en Matriz.
+
+Cuando recibas credenciales, valida el canal de solo lectura sin enviar ordenes:
+
+```bash
+python -m scripts.check_primary_readonly
+```
+
+---
+
+## Antes de operar
+
+Ejecuta el preflight de solo lectura:
+
+```bash
+python -m scripts.check_operational_readonly
+```
+
+El resultado debe ser `LISTO` durante la rueda antes de tomar una señal. El
+dashboard bloquea tickets cuando el tarifario efectivo del ALyC no fue validado.
+Carga porcentajes reales y habilita el gate solo despues de verificarlos:
+
+```ini
+COSTS_PROFILE=nombre-del-alyc-y-cuenta
+COSTS_VERIFIED=true
+STOCK_COMMISSION_PCT=
+OPTION_COMMISSION_PCT=
+EXERCISE_COMMISSION_PCT=
+STOCK_MARKET_FEE_PCT=0.080
+OPTION_MARKET_FEE_PCT=0.200
+EXERCISE_MARKET_FEE_PCT=0.080
+IVA_RATE=0.21
+```
+
+Si solo dispones del tarifario publico, podes cargar un perfil conservador con
+los maximos documentados del ALyC y derechos deliberadamente holgados. Etiqueta
+el perfil con claridad: puede descartar oportunidades validas, pero no debe
+aprobar una oportunidad marginal por subestimar costos.
+
+Para IOL, el tarifario publico vigente informa hasta 1% para cuentas vinculadas
+o referenciadas, derechos de 0.05% para acciones y 0.20% para opciones, mas IVA.
+El perfil conservador local modela el ejercicio como operacion sobre acciones:
+
+```ini
+COSTS_PROFILE=iol-public-ceiling-conservative-2026-06-02
+COSTS_VERIFIED=true
+STOCK_COMMISSION_PCT=1.00
+OPTION_COMMISSION_PCT=1.00
+EXERCISE_COMMISSION_PCT=1.00
+STOCK_MARKET_FEE_PCT=0.050
+OPTION_MARKET_FEE_PCT=0.200
+EXERCISE_MARKET_FEE_PCT=0.050
+IVA_RATE=0.21
+```
+
+Desde el 24 de abril de 2026, BYMA Clearing procesa opciones con liquidacion de
+prima T+0 y ejercicio automatico al vencimiento para opciones ITM. Confirma en
+Matriz cada posicion real: cerrar un registro del dashboard nunca envia ordenes.
+
+---
+
 ## Nota importante
 
-> El bot te muestra la mejor jugada segun criterios quant, pero **no opera solo**. Vos sos quien decide ejecutar en Bull Market.
+> El bot te muestra la mejor jugada segun criterios quant, pero **no opera solo**. Vos sos quien decide ejecutar manualmente en Matriz.
 >
 > El semaforo verde **reduce** el riesgo, no lo elimina. Las opciones tienen riesgo de mercado real: si GGAL cae mucho mas del colchon, perdes dinero. Operar con capital que puedas permitirte inmovilizar por el plazo del vencimiento.
->
-> Los datos en modo demo son sinteticos. Para operar con datos reales, configura las credenciales en `.env`.

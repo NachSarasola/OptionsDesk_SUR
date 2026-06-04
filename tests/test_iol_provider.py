@@ -124,15 +124,16 @@ def test_iol_chain_carries_observed_multiletter_expiry(monkeypatch):
         "volumenNominal": 1000,
         "fechaHora": "2026-06-01T15:00:00-03:00",
     }
-    option = {
-        "simbolo": "GFGC4000JU",
-        "fechaVencimiento": "2026-06-19T00:00:00",
-    }
     quote = {
         "ultimoPrecio": 150.0,
         "puntas": [{"precioCompra": 149.0, "precioVenta": 151.0}],
         "volumenNominal": 100,
         "fechaHora": "2026-06-01T15:00:00-03:00",
+    }
+    option = {
+        "simbolo": "GFGC4000JU",
+        "fechaVencimiento": "2026-06-19T00:00:00",
+        "cotizacion": quote,
     }
 
     def fake_get(path, quiet_statuses=None):  # noqa: ARG001
@@ -140,14 +141,101 @@ def test_iol_chain_carries_observed_multiletter_expiry(monkeypatch):
             return spot
         if path.endswith("/GGAL/Opciones"):
             return [option]
-        if path.endswith("/GFGC4000JU/Cotizacion"):
-            return quote
         raise AssertionError(path)
 
     monkeypatch.setattr(p, "_get", fake_get)
+    monkeypatch.setattr("optionsdesk.data.providers.iol.settings.iol_option_quotes_per_cycle", 0)
 
     chain = p.get_options_chain()
 
     assert chain is not None
     assert chain.expiry_calendar == {"JU": date(2026, 6, 19)}
     assert "GFGC4000JU" in chain.options
+
+
+def test_iol_chain_fetches_only_limited_nearest_quotes_when_listing_is_empty(monkeypatch):
+    p = IOLProvider()
+    p._connected = True
+    p._token_mgr = _DummyTokenMgr()
+    paths = []
+    spot = {
+        "ultimoPrecio": 4000.0,
+        "puntas": [{"precioCompra": 3999.0, "precioVenta": 4001.0}],
+    }
+    items = [
+        {
+            "simbolo": symbol,
+            "fechaVencimiento": "2026-06-19T00:00:00",
+            "cotizacion": {"cantidadOperaciones": 0, "puntas": []},
+        }
+        for symbol in ("GFGC4000JU", "GFGV4000JU", "GFGC4500JU")
+    ]
+
+    def fake_get(path, quiet_statuses=None):  # noqa: ARG001
+        paths.append(path)
+        if path.endswith("/GGAL/Cotizacion"):
+            return spot
+        if path.endswith("/GGAL/Opciones"):
+            return items
+        return {
+            "cantidadOperaciones": 1,
+            "ultimoPrecio": 100.0,
+            "puntas": [{"precioCompra": 99.0, "precioVenta": 101.0}],
+        }
+
+    monkeypatch.setattr(p, "_get", fake_get)
+    monkeypatch.setattr("optionsdesk.data.providers.iol.settings.iol_option_quotes_per_cycle", 2)
+
+    chain = p.get_options_chain()
+
+    assert chain is not None
+    assert set(chain.options) == {"GFGC4000JU", "GFGV4000JU"}
+    assert sum(path.endswith("/Cotizacion") for path in paths) == 3  # spot + 2 opciones
+
+
+def test_iol_get_quote_uses_requested_stock_symbol(monkeypatch):
+    p = IOLProvider()
+    p._connected = True
+    p._token_mgr = _DummyTokenMgr()
+    paths = []
+
+    def fake_get(path, quiet_statuses=None):  # noqa: ARG001
+        paths.append(path)
+        return {
+            "ultimoPrecio": 41200.0,
+            "puntas": [{"precioCompra": 41150.0, "precioVenta": 41250.0}],
+            "volumenNominal": 1234,
+            "fechaHora": "2026-06-03T15:00:00-03:00",
+        }
+
+    monkeypatch.setattr(p, "_get", fake_get)
+
+    quote = p.get_quote("YPFD")
+
+    assert quote is not None
+    assert quote.symbol == "YPFD"
+    assert quote.bid == pytest.approx(41150.0)
+    assert quote.ask == pytest.approx(41250.0)
+    assert paths == ["bCBA/Titulos/YPFD/Cotizacion"]
+
+
+def test_iol_get_quotes_returns_multiple_symbols(monkeypatch):
+    p = IOLProvider()
+    calls = []
+
+    def fake_get_quote(symbol):
+        calls.append(symbol)
+        return _parse_quote(
+            symbol,
+            {
+                "ultimoPrecio": 100.0,
+                "puntas": [{"precioCompra": 99.0, "precioVenta": 101.0}],
+            },
+        )
+
+    monkeypatch.setattr(p, "get_quote", fake_get_quote)
+
+    quotes = p.get_quotes(["ggal", "YPFD", "GGAL"])
+
+    assert set(quotes) == {"GGAL", "YPFD"}
+    assert set(calls) == {"GGAL", "YPFD"}

@@ -40,7 +40,7 @@ Al terminar te muestra la URL: `http://<IP_DEL_VPS>`.
 | Servicio | Qué hace |
 |----------|----------|
 | `optionsdesk-dashboard` | Streamlit en :8501 (nginx hace proxy → :80) |
-| `optionsdesk-recorder` | Graba snapshots cada 15s vía WebSocket Bull Market |
+| `optionsdesk-recorder` | Graba snapshots. Prefiere Primary WebSocket; con IOL REST aplica un piso conservador de 900s |
 | `optionsdesk-monitor.timer` | Dispara el monitor de posiciones cada 5 min (L-V 10:30-17:00) |
 
 ```bash
@@ -101,13 +101,13 @@ journalctl -n 50 -u optionsdesk-dashboard
 # Causa más común: Streamlit no inició aún. Esperar 10s y recargar.
 ```
 
-### Recorder no conecta a Bull Market
+### Recorder no conecta al feed de mercado
 
 ```bash
 journalctl -n 50 -u optionsdesk-recorder
-# Causas: .env mal configurado, IP del VPS bloqueada por Bull Market (poco frecuente),
-# pyhomebroker actualización breaking. Verificar en local primero.
-cat /opt/optionsdesk/.env   # confirmar que tiene HB_DNI, HB_USER, etc.
+# Causas: .env mal configurado, host Primary incorrecto para el ALyC,
+# credenciales vencidas o API IOL temporalmente no disponible.
+cat /opt/optionsdesk/.env   # confirmar las variables del proveedor elegido
 ```
 
 ### nginx: "port 80 already in use"
@@ -143,11 +143,25 @@ journalctl -n 20 -u optionsdesk-monitor
 ## Variables de entorno (.env)
 
 ```ini
-# Bull Market (requerido para datos reales)
-HB_DNI=12345678
-HB_USER=tu_usuario
-HB_PASSWORD=tu_password
-HB_BROKER_ID=6          # Bull Market = 6 (ver pyhomebroker README)
+# Primary Trading API / Matriz OMS (recomendado para datos realtime)
+# Sandbox gratuito: https://api.remarkets.primary.com.ar
+# Produccion: usar el host xOMS informado por tu ALyC.
+PRIMARY_BASE_URL=https://api.remarkets.primary.com.ar
+PRIMARY_USER=tu_usuario
+PRIMARY_PASSWORD=tu_password
+# Opcionales: el provider descubre los instrumentos automaticamente.
+PRIMARY_WS_URL=
+PRIMARY_SPOT_SYMBOL=
+PRIMARY_CAUCION_SYMBOL=
+
+# IOL (fallback REST)
+IOL_USER=
+IOL_PASSWORD=
+IOL_DASHBOARD_REFRESH_S=60
+IOL_RECORDER_INTERVAL_S=900
+IOL_OPTION_QUOTES_PER_CYCLE=8
+IOL_OPTIONS_LIST_TTL_S=900
+SPOT_TAPE_INTERVAL_S=60
 
 # Telegram (opcional — alertas)
 TELEGRAM_TOKEN=
@@ -158,6 +172,29 @@ RECORDER_INTERVAL_S=15  # default 15s
 MIN_TNA_SPREAD_PCT=5.0
 HORIZON_MONITOR_ENABLED=true
 OPEN_POSITIONS_FILE=data/open_positions.jsonl
+
+# Obligatorio antes de habilitar tickets reales
+COSTS_PROFILE=iol-public-ceiling-conservative-2026-06-02
+COSTS_VERIFIED=false
+STOCK_COMMISSION_PCT=1.00
+OPTION_COMMISSION_PCT=1.00
+EXERCISE_COMMISSION_PCT=1.00
+STOCK_MARKET_FEE_PCT=0.050
+OPTION_MARKET_FEE_PCT=0.200
+EXERCISE_MARKET_FEE_PCT=0.050
+IVA_RATE=0.21
+```
+
+Para validar Primary sin enviar ordenes:
+
+```bash
+python -m scripts.check_primary_readonly
+```
+
+Antes de operar manualmente en Matriz:
+
+```bash
+python -m scripts.check_operational_readonly
 ```
 
 ---

@@ -24,19 +24,19 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-from optionsdesk.backtest.engine import BacktestEngine, _reconstruct_chain
+from optionsdesk.backtest.engine import _reconstruct_chain
 from optionsdesk.core.benchmark import Benchmark
 from optionsdesk.core.pricing import crr_price
 from optionsdesk.signals.management import evaluate_position, SignalType
 from optionsdesk.signals.monitor import OpenPosition
-from optionsdesk.signals.recommender import RiskProfile, _passes_gates, _score
+from optionsdesk.signals.recommender import RiskProfile, _passes_gates
 from optionsdesk.strategies.covered_call import CoveredCallConfig, CoveredCallScanner
 from optionsdesk.strategies.short_put import ShortPutConfig, ShortPutScanner
 
@@ -179,7 +179,7 @@ def simulate_strategy(
     Returns:
         SimResult con trades, equity_curve y pnl_series.
     """
-    from optionsdesk.signals.recommender import _WEIGHTS, _get_weights
+    from optionsdesk.signals.recommender import _get_weights
     from optionsdesk.core.instruments import load_expiry_calendar
 
     if isinstance(start, str):
@@ -330,7 +330,6 @@ def simulate_strategy(
 
             if candidates:
                 # Scoring con pesos (posiblemente custom para GridSearch)
-                from optionsdesk.signals.recommender import _score as _score_fn
                 scored = sorted(
                     candidates,
                     key=lambda r: _score_with_weights(r, profile, weights),

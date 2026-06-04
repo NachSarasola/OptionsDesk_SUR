@@ -228,7 +228,7 @@ def compute_short_put(
     tea = (1.0 + period_rate) ** (1.0 / T) - 1.0
 
     # Breakeven: spot al cual se empieza a perder si se ejerce
-    breakeven_spot = contract.strike - net_premium - cost_assignment
+    breakeven_spot = contract.strike - net_premium + cost_assignment
     cushion_pct = (spot - breakeven_spot) / spot * 100.0 if spot > 0 else 0.0
 
     moneyness = contract.moneyness(spot, atm_threshold_pct)

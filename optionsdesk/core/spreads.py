@@ -13,7 +13,7 @@ requerida. Con spreads bid-ask amplios el edge se reduce rapido.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 def _try_import_pta():
     try:
         import pandas_ta as pta   # type: ignore[import-not-found]
+        required = ("sma", "ema", "rsi", "atr", "macd")
+        if not all(callable(getattr(pta, name, None)) for name in required):
+            return None
         return pta
     except Exception:
         return None

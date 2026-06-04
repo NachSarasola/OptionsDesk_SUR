@@ -4,7 +4,7 @@ Description=OptionsDesk — Monitor de posiciones cada 5 min en horario de merca
 [Timer]
 # Lunes a viernes 10:30–17:00 (hora de Argentina = UTC-3)
 # 10:30 ART = 13:30 UTC; 17:00 ART = 20:00 UTC
-OnCalendar=Mon-Fri 13:30..20:00/5min
+OnCalendar=Mon..Fri *-*-* 13..20:0/5
 Unit=optionsdesk-monitor.service
 Persistent=false
 

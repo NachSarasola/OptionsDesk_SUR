@@ -34,7 +34,7 @@ _PROFILE_CFG = {
         "min_score_actionable": 64.0,
         "min_pop": 0.56,
         "max_breakeven_move_pct": 0.28,
-        "time_stop_min": 15,
+        "time_stop_min": 60,
         "flat_before_close_min": 15,
         "allow_edge_session": False,
     },
@@ -50,7 +50,7 @@ _PROFILE_CFG = {
         "min_score_actionable": 48.0,
         "min_pop": 0.52,
         "max_breakeven_move_pct": 0.65,
-        "time_stop_min": 20,
+        "time_stop_min": 120,
         "flat_before_close_min": 10,
         "allow_edge_session": False,
     },
@@ -66,7 +66,7 @@ _PROFILE_CFG = {
         "min_score_actionable": 52.0,
         "min_pop": 0.42,
         "max_breakeven_move_pct": 0.60,
-        "time_stop_min": 20,
+        "time_stop_min": 150,
         "flat_before_close_min": 10,
         "allow_edge_session": True,
     },
@@ -150,6 +150,7 @@ class LivePulse:
     observations: int = 0
     span_s: float = 0.0
     source: str = "spot_tape"
+    efficiency: float = 0.0   # Kaufman ER: desplazamiento neto / camino recorrido (0=chop, 1=tendencia limpia)
 
 
 @dataclass
@@ -163,6 +164,9 @@ class ScalpVerdict:
     session_phase: str = ""
     pulse: Optional[LivePulse] = None
     mode: str = "INTRADAY"
+    # SMC killzone (v2.4): "manipulacion" | "distribucion" | None
+    # Solo anotación informativa — no bloquea ni cambia la lógica de trading.
+    smc_killzone: Optional[str] = None
 
 
 def compute_spot_tape_pulse(
@@ -171,9 +175,17 @@ def compute_spot_tape_pulse(
     min_observations: int = 5,
     min_span_s: float = 60.0,
     min_move_pct: float = 0.08,
+    min_efficiency: float = 0.35,
     source: str = "spot_tape_iol",
 ) -> LivePulse:
-    """Resume un tape corto de spot sin inventar barras ni hacer lookahead."""
+    """Resume un tape corto de spot sin inventar barras ni hacer lookahead.
+
+    El `first-vs-last` solo no alcanza: una cinta que oscila con violencia pero
+    termina +0.1% leía BULL con falsa confianza. Agregamos el Kaufman Efficiency
+    Ratio (desplazamiento neto / suma de pasos absolutos): el chop tiene ER bajo
+    y se clasifica NEUTRAL aunque los extremos difieran. Así el pulso solo confirma
+    cuando hay intención direccional real, que es lo que un scalper necesita.
+    """
     clean = sorted(
         (ts, float(px))
         for ts, px in samples
@@ -183,15 +195,24 @@ def compute_spot_tape_pulse(
         return LivePulse(False, source=source)
 
     span_s = max((clean[-1][0] - clean[0][0]).total_seconds(), 0.0)
-    first = clean[0][1]
-    last = clean[-1][1]
+    prices = [px for _, px in clean]
+    first, last = prices[0], prices[-1]
     move_pct = ((last / first) - 1.0) * 100.0 if first > 0 else 0.0
+
+    path = sum(abs(prices[i] - prices[i - 1]) for i in range(1, len(prices)))
+    efficiency = abs(last - first) / path if path > 0 else 0.0
+
     direction = (
         "BULL" if move_pct >= min_move_pct
         else "BEAR" if move_pct <= -min_move_pct
         else "NEUTRAL"
     )
-    confirmed = len(clean) >= min_observations and span_s >= min_span_s and direction != "NEUTRAL"
+    confirmed = (
+        len(clean) >= min_observations
+        and span_s >= min_span_s
+        and direction != "NEUTRAL"
+        and efficiency >= min_efficiency
+    )
     return LivePulse(
         confirmed=confirmed,
         direction=direction,
@@ -199,6 +220,7 @@ def compute_spot_tape_pulse(
         observations=len(clean),
         span_s=round(span_s, 1),
         source=source,
+        efficiency=round(efficiency, 3),
     )
 
 
@@ -226,6 +248,14 @@ def build_scalp_verdict(
     if not pulse.confirmed:
         blockers.append("sin_confirmacion_intradia_live")
 
+    # SMC killzone (v2.4) — anotación informativa, no bloquea
+    _smc_killzone: Optional[str] = None
+    try:
+        from optionsdesk.signals.smc import current_killzone as _ckz
+        _smc_killzone = _ckz()
+    except Exception:
+        pass
+
     if blockers:
         return ScalpVerdict(
             decision="WAIT",
@@ -234,6 +264,7 @@ def build_scalp_verdict(
             session_phase=phase,
             pulse=pulse,
             mode=mode,
+            smc_killzone=_smc_killzone,
         )
 
     viable = [
@@ -252,6 +283,7 @@ def build_scalp_verdict(
             session_phase=phase,
             pulse=pulse,
             mode=mode,
+            smc_killzone=_smc_killzone,
         )
 
     best = max(viable, key=_signal_rank)
@@ -262,6 +294,7 @@ def build_scalp_verdict(
         session_phase=phase,
         pulse=pulse,
         mode=mode,
+        smc_killzone=_smc_killzone,
     )
 
 
@@ -356,18 +389,21 @@ def _trade_plan_detail(
         atr_move = spot * min(max(atr_pct, 0.008), 0.045)
         side = 1.0 if is_call else -1.0
 
+        # Stops ensanchados: con holds de hasta 2-3h, un stop de 0.2×ATR se come el
+        # ruido intradiario antes de que el subyacente desarrolle el movimiento.
+        # Se mantiene ~2R objetivo/stop.
         if playbook == "Seguir ola":
-            stop_move = atr_move * 0.20
-            target_move = atr_move * 0.40
+            stop_move = atr_move * 0.30
+            target_move = atr_move * 0.60
         elif playbook == "Pricear rebote":
-            stop_move = atr_move * 0.15
-            target_move = atr_move * 0.35
-        elif playbook == "Voladura/breakout":
-            stop_move = atr_move * 0.25
+            stop_move = atr_move * 0.22
             target_move = atr_move * 0.50
+        elif playbook == "Voladura/breakout":
+            stop_move = atr_move * 0.35
+            target_move = atr_move * 0.70
         else:
-            stop_move = atr_move * 0.20
-            target_move = atr_move * 0.40
+            stop_move = atr_move * 0.30
+            target_move = atr_move * 0.60
 
         sl_u = spot - side * stop_move
         tp_u = spot + side * target_move
@@ -525,6 +561,8 @@ def _risk_flags_for_signal(
         flags.append("capital_no_cargado")
     if not g.is_tradeable:
         flags.append(g.liquidity_reason or "no_tradeable")
+    if rr < 1.0:
+        flags.append("rr_inferior_a_1")
     if rr < min_rr:
         flags.append(f"rr<{min_rr:.1f}")
     if g.quote_age_s > max_age_s and not any("stale" in flag for flag in flags):
@@ -593,13 +631,18 @@ def _session_flags(cfg: dict[str, float]) -> list[str]:
     if not cfg.get("enforce_session"):
         return []
 
-    now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    cfg_now = cfg.get("session_now")
+    now = (
+        cfg_now.astimezone(ZoneInfo("America/Argentina/Buenos_Aires"))
+        if isinstance(cfg_now, datetime)
+        else datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    )
     if now.weekday() >= 5:
         return ["fuera_horario_byma"]
 
     open_dt = now.replace(hour=11, minute=0, second=0, microsecond=0)
     close_dt = now.replace(hour=17, minute=0, second=0, microsecond=0)
-    start_ok_dt = open_dt + timedelta(minutes=5)
+    start_ok_dt = open_dt + timedelta(minutes=settings.scalping_start_after_open_min)
     end_ok_dt = close_dt - timedelta(minutes=int(cfg.get("flat_before_close_min", 10)))
     t = now.time()
     if t < open_dt.time() or t >= close_dt.time():
@@ -614,12 +657,17 @@ def _session_flags(cfg: dict[str, float]) -> list[str]:
 
 def _add_watch_flags(sig: ScalpSignal, *flags: str) -> ScalpSignal:
     """Agrega motivos de watchlist sin duplicarlos."""
+    hard_added = False
     for flag in flags:
         if flag and flag not in sig.risk_flags:
             sig.risk_flags.append(flag)
-        if flag and flag not in sig.blocking_flags:
-            sig.blocking_flags.append(flag)
-    if flags:
+        if flag and _is_hard_flag(flag):
+            hard_added = True
+            if flag not in sig.blocking_flags:
+                sig.blocking_flags.append(flag)
+        elif flag and flag not in sig.warning_flags:
+            sig.warning_flags.append(flag)
+    if hard_added:
         sig.confidence = "watchlist"
     return sig
 
@@ -634,13 +682,14 @@ def _direction_bias(snap) -> str:
         return "NEUTRAL"
     trend = str(getattr(snap, "trend", "LATERAL") or "LATERAL").upper()
     mom = float(getattr(snap, "momentum", 0.0) or 0.0)
+    threshold = float(getattr(snap, "momentum_threshold_pct", settings.scalping_momentum_threshold))
     if trend == "ALCISTA" and mom >= 0:
         return "BULL"
     if trend == "BAJISTA" and mom <= 0:
         return "BEAR"
-    if mom >= settings.scalping_momentum_threshold:
+    if mom >= threshold:
         return "BULL"
-    if mom <= -settings.scalping_momentum_threshold:
+    if mom <= -threshold:
         return "BEAR"
     return "NEUTRAL"
 
@@ -743,19 +792,18 @@ def _liquidity_score(g: OptionGreeks, cfg: dict[str, float]) -> float:
     return spread_score + volume_score + size_score
 
 
-def _signal_rank(sig: ScalpSignal) -> tuple[int, float, float, float, float, float, float, float]:
-    """Ranking PoP-first: operar primero la mayor probabilidad viable."""
-    risk = max(sig.planned_risk_ars, 0.01)
-    ev_per_risk = sig.expected_value_ars / risk
+def _signal_rank(sig: ScalpSignal) -> tuple[int, int, float, float, float, float, float, float, float]:
+    """Radar ranking. Real manual tickets are ranked by execution in scalp_tickets."""
     return (
         1 if sig.confidence == "actionable" else 0,
-        sig.probability_of_profit,
-        ev_per_risk,
+        1 if sig.signal_type in {"WAVE_RIDE", "VOL_BREAKOUT"} else 0,
         -sig.cost_to_target_pct,
-        sig.fill_probability,
+        -sig.spread_pct,
         sig.score,
         sig.plan_rr,
-        -sig.spread_pct,
+        abs(sig.delta),
+        -sig.breakeven_move_pct,
+        -sig.friction_pct,
     )
 
 
@@ -892,15 +940,19 @@ def _cost_to_target_pct(sig: ScalpSignal) -> float:
     return round(max(sig.friction_ars, 0.0) / gross_target * 100.0, 2)
 
 
-def _current_session_phase(eod_window_min: int = 35) -> str:
+def _current_session_phase(eod_window_min: int = 35, now: Optional[datetime] = None) -> str:
     """Fase de la sesion BYMA. "close" abarca los ultimos eod_window_min minutos."""
-    now = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    now = (
+        now.astimezone(ZoneInfo("America/Argentina/Buenos_Aires"))
+        if isinstance(now, datetime)
+        else datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    )
     if now.weekday() >= 5:
         return "closed"
     t = now.time()
     if t < dt_time(11, 0) or t >= dt_time(17, 0):
         return "closed"
-    if t < dt_time(11, 20):
+    if t < (datetime.combine(now.date(), dt_time(11, 0)) + timedelta(minutes=settings.scalping_start_after_open_min)).time():
         return "open"
     close_dt = datetime.combine(now.date(), dt_time(17, 0))
     eod_start = (close_dt - timedelta(minutes=max(int(eod_window_min), 5))).time()
@@ -936,7 +988,6 @@ def _is_hard_flag(flag: str) -> bool:
         "riesgo_total",
         "max_scalps",
         "spread_extremo",
-        "ev_no_positivo",
         "quote stale",
         "sin puntas",
         "mid invalido",
@@ -949,10 +1000,17 @@ def _is_hard_flag(flag: str) -> bool:
         "delta_baja",
         "strike_lejano",
         "stop_dentro_spread",
+        "rr_inferior_a_1",
         "iv_barata_no_direccional",
         "venta_iv_solo_contexto",
         "sin_confirmacion_intradia_live",
         "pulso_live_",
+        "ola_sin_confirmacion",
+        "rebote_sin_choch",
+        "rebote_contra_tendencia",
+        "esperando_breakout_direccion",
+        "voladura_sin_confirmar",
+        "confirmar_breakout",
     )
     return flag.startswith(hard_prefixes)
 
@@ -986,7 +1044,9 @@ def _finalize_as_watchlist(
         profile_cfg=profile_cfg,
         realized_vol=realized_vol,
     )
-    return _add_watch_flags(sig, *flags)
+    sig = _add_watch_flags(sig, *flags)
+    sig.confidence = "watchlist"
+    return sig
 
 
 def _finalize_signal(
@@ -1023,8 +1083,14 @@ def _finalize_signal(
     sig.fill_probability = _fill_probability(g, sig, cfg)
     sig.cost_to_target_pct = _cost_to_target_pct(sig)
     sig.microstructure_bias = _microstructure_bias(g)
-    sig.session_phase = _current_session_phase(
-        eod_window_min=int(getattr(settings, "scalping_eod_window_min", 35))
+    session_now = cfg.get("session_now")
+    sig.session_phase = (
+        _current_session_phase(
+            eod_window_min=int(getattr(settings, "scalping_eod_window_min", 35)),
+            now=session_now,
+        )
+        if isinstance(session_now, datetime)
+        else _current_session_phase(eod_window_min=int(getattr(settings, "scalping_eod_window_min", 35)))
     )
 
     flags = _risk_flags_for_signal(
@@ -1077,7 +1143,7 @@ def _finalize_signal(
     if cfg.get("overnight_mode") and sig.suggested_lots > 0:
         size_factor = float(cfg.get("overnight_sizing_factor", 0.5))
         sig.suggested_lots = max(int(sig.suggested_lots * size_factor), 1)
-    if capital is not None and capital > 0 and sig.suggested_lots <= 0:
+    if cfg.get("require_capital") and capital is not None and capital > 0 and sig.suggested_lots <= 0:
         flags.append("capital_insuficiente")
     if cfg.get("require_capital") and (capital is None or capital <= 0):
         sig.suggested_lots = 0
@@ -1092,7 +1158,10 @@ def _finalize_signal(
     max_age_s = float(cfg.get("max_age_s", 90.0))
     quote_age_s = max(float(getattr(g, "quote_age_s", 0.0) or 0.0), 0.0)
     ttl_s = max(30.0, min(180.0, max_age_s - quote_age_s))
-    sig.valid_until = (datetime.now() + timedelta(seconds=ttl_s)).isoformat(timespec="seconds")
+    valid_clock = cfg.get("session_now")
+    if not isinstance(valid_clock, datetime):
+        valid_clock = datetime.now()
+    sig.valid_until = (valid_clock + timedelta(seconds=ttl_s)).isoformat(timespec="seconds")
     deduped_flags = list(dict.fromkeys(flags))
     blocking, warnings = _split_flags(deduped_flags)
     sig.blocking_flags = blocking
@@ -1381,8 +1450,15 @@ def scan_volatility_breakout(
     atr_pct = _snap_float(snap, "atr_pct", 0.0)
     vol_ok = bool(getattr(snap, "vol_confirms", False))
     bias = _direction_bias(snap)
-    explosive = abs(mom) >= 3.0 or atr_pct >= 2.6 or (vol_ok and abs(mom) >= 1.5)
-    if not explosive:
+    threshold = float(getattr(snap, "momentum_threshold_pct", settings.scalping_momentum_threshold))
+    structure_for_bias = _structure_confirms(snap, bias) if bias in ("BULL", "BEAR") else False
+    expansion_ok = (
+        structure_for_bias
+        or vol_ok
+        or abs(mom) >= max(threshold * 1.6, 0.28)
+        or atr_pct >= max(threshold, 0.20)
+    )
+    if not expansion_ok:
         return []
 
     sides = [bias] if bias in ("BULL", "BEAR") else ["BULL", "BEAR"]
@@ -1392,9 +1468,9 @@ def scan_volatility_breakout(
         structure_ok = _structure_confirms(snap, side)
         for g in _movement_pool(greeks, opt_type, max_days=25, min_delta=0.20, max_abs_moneyness=14.0):
             # vol_edge no es info direccional -> no sumar al breakout score (IV barata != alcista/bajista)
-            breakout_score = min(abs(mom) * 2.0, 10.0) + min(atr_pct * 1.5, 8.0)
+            breakout_score = min(abs(mom) * 16.0, 12.0) + min(atr_pct * 18.0, 8.0)
             breakout_score += 4.0 if vol_ok else 0.0
-            breakout_score += 5.0 if structure_ok else 0.0
+            breakout_score += 8.0 if structure_ok else 0.0
             score = max(0.0, min(100.0, _option_movement_score(g, cfg) + breakout_score))
 
             flags: list[str] = []
@@ -1799,11 +1875,12 @@ def scan_all(
     require_live_confirmation: bool = False,
     live_confirmation: bool = False,
     live_direction: str = "NEUTRAL",
+    now: Optional[datetime] = None,
 ) -> tuple[dict[str, OptionGreeks], list[ScalpSignal]]:
     profile_key = str(risk_profile or "balanced").lower()
     cfg = dict(_PROFILE_CFG.get(profile_key, _PROFILE_CFG["balanced"]))
     cfg["enforce_session"] = True
-    cfg["require_capital"] = True
+    cfg["require_capital"] = not settings.scalping_manual_sizing
     cfg["max_open_scalps"] = settings.scalping_max_open_positions
     cfg["max_total_risk_pct"] = settings.scalping_max_total_risk_pct
     cfg["time_stop_min"] = settings.scalping_no_progress_min
@@ -1811,15 +1888,21 @@ def scan_all(
     cfg["require_live_confirmation"] = require_live_confirmation
     cfg["live_confirmation"] = live_confirmation
     cfg["live_direction"] = str(live_direction or "NEUTRAL").upper()
+    if now is not None:
+        cfg["session_now"] = now
 
     # Overnight es una estrategia explicita. El scanner intradia no cambia de
     # mandato automaticamente cerca del cierre.
     eod_window = int(getattr(settings, "scalping_eod_window_min", 35))
-    phase = _current_session_phase(eod_window_min=eod_window)
+    phase = (
+        _current_session_phase(eod_window_min=eod_window, now=now)
+        if now is not None
+        else _current_session_phase(eod_window_min=eod_window)
+    )
     if phase == "close" and allow_overnight_entries:
         cfg = _overnight_overrides(cfg)
 
-    greeks = compute_chain_greeks(chain, expiry_calendar, r=r)
+    greeks = compute_chain_greeks(chain, expiry_calendar, r=r, now=now)
     if not greeks:
         return {}, []
 
@@ -1830,7 +1913,7 @@ def scan_all(
         scan_wave_ride(
             greeks,
             snap,
-            momentum_threshold=settings.scalping_momentum_threshold,
+            momentum_threshold=float(getattr(snap, "momentum_threshold_pct", settings.scalping_momentum_threshold)),
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
@@ -1861,7 +1944,7 @@ def scan_all(
         scan_momentum(
             greeks,
             snap,
-            momentum_threshold=settings.scalping_momentum_threshold,
+            momentum_threshold=float(getattr(snap, "momentum_threshold_pct", settings.scalping_momentum_threshold)),
             capital=capital,
             positions=positions,
             profile_cfg=cfg,
@@ -1930,6 +2013,10 @@ def scan_all(
             sig.score = min(sig.score + 4.0 * (n - 1), 100.0)
             if "[x" not in sig.rationale:
                 sig.rationale = f"[x{n} setups] " + sig.rationale
+
+    if not settings.costs_verified:
+        for sig in seen.values():
+            _add_watch_flags(sig, "costos_no_verificados")
 
     final = sorted(seen.values(), key=_signal_rank, reverse=True)
     return greeks, final

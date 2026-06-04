@@ -40,6 +40,8 @@ class Order:
     filled_price: Optional[float] = None
     broker_id: Optional[str] = None
     notes: str = ""
+    term: str = "t1"                        # plazo de liquidacion IOL: t0/t1/t2
+    valid_until: Optional[datetime] = None  # validez de la orden (None = fin de rueda)
 
 
 class OrderExecutor(ABC):

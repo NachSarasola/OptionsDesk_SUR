@@ -79,10 +79,10 @@ def test_size_position_kelly_mode():
     # kelly_contracts = floor(1250/5000) = 0 → min 1 contrato
     rec = _make_rec(net_outlay=50.0, ev_ars=500.0, pop=0.7)
     n = size_position(capital=100_000.0, rec=rec)
-    assert n >= 1
+    assert n == 0
 
 
-def test_size_position_minimum_one_contract():
+def test_size_position_fixed_fractional_can_return_one_contract():
     """Devuelve ≥ 1 si el capital alcanza para 1 lote y el 20% cap lo permite.
 
     net_outlay=50 → lote = 5000 ARS. Con capital=30_000, 20%=6_000 > 5_000
@@ -91,7 +91,7 @@ def test_size_position_minimum_one_contract():
     """
     rec = _make_rec(net_outlay=50.0, ev_ars=None, pop=None)   # fixed fractional
     n = size_position(capital=30_000.0, rec=rec)
-    assert n >= 1
+    assert n == 1
 
 
 def test_size_position_cap_20pct():

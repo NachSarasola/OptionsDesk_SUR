@@ -290,3 +290,31 @@ def scenario_pnl(
         pnl_by_shock.append(round(total_pnl, 0))
 
     return ScenarioPnL(shock_pcts=shock_pcts, pnl_ars=pnl_by_shock)
+
+
+def gap_stress(
+    positions: list[OpenPosition],
+    current_spot: float,
+    current_iv_map: Optional[dict[str, float]] = None,
+) -> ScenarioPnL:
+    """Stress de gap fuerte para un libro concentrado en GGAL (un solo subyacente).
+
+    Todo el libro (calls + puts + caución) está expuesto al MISMO spot: un gap de
+    GGAL atraviesa todas las posiciones a la vez. Reprice con shocks severos
+    (hasta ±20%) para ver la pérdida de cola que el delta/theta del día esconden —
+    especialmente las puts vendidas, que explotan en un gap a la baja.
+    """
+    return scenario_pnl(
+        positions,
+        current_spot,
+        shock_pcts=[-20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0],
+        current_iv_map=current_iv_map,
+    )
+
+
+def worst_case_loss(scenario: ScenarioPnL) -> tuple[float, float]:
+    """Devuelve (shock_pct, pnl) del peor escenario (mayor pérdida) del stress."""
+    if not scenario.pnl_ars:
+        return 0.0, 0.0
+    idx = min(range(len(scenario.pnl_ars)), key=lambda i: scenario.pnl_ars[i])
+    return scenario.shock_pcts[idx], scenario.pnl_ars[idx]

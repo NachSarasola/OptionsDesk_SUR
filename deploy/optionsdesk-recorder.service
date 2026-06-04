@@ -1,5 +1,5 @@
 [Unit]
-Description=OptionsDesk — Chain recorder (WebSocket Bull Market)
+Description=OptionsDesk — Chain recorder (Primary/IOL)
 After=network-online.target
 Wants=network-online.target
 

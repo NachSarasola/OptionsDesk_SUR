@@ -4,7 +4,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from optionsdesk.data.history import daily_with_live_spot, tape_ohlc, weekly_from_daily
+from optionsdesk.data.history import (
+    append_spot_tape,
+    daily_with_live_spot,
+    load_spot_tape,
+    tape_ohlc,
+    weekly_from_daily,
+)
 
 
 _BA = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -87,3 +93,28 @@ def test_weekly_from_daily_includes_current_live_week():
     assert len(result) == 2
     assert result.iloc[-1]["date"] == pd.Timestamp("2026-06-05")
     assert result.iloc[-1]["close"] == pytest.approx(104.0)
+
+
+def test_spot_tape_persists_real_samples_and_respects_min_interval(tmp_path):
+    path = tmp_path / "spot_tape.jsonl"
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=_BA)
+
+    append_spot_tape(100.0, "IOL", path, now=now)
+    append_spot_tape(101.0, "IOL", path, now=now + timedelta(seconds=2))
+    append_spot_tape(102.0, "IOL", path, now=now + timedelta(minutes=1))
+
+    samples = load_spot_tape(path, now=now + timedelta(minutes=1))
+
+    assert [spot for _, spot in samples] == [100.0, 102.0]
+
+
+def test_spot_tape_discards_previous_day(tmp_path):
+    path = tmp_path / "spot_tape.jsonl"
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=_BA)
+
+    append_spot_tape(99.0, "IOL", path, now=now - timedelta(days=1))
+    append_spot_tape(100.0, "IOL", path, now=now)
+
+    samples = load_spot_tape(path, now=now)
+
+    assert [spot for _, spot in samples] == [100.0]

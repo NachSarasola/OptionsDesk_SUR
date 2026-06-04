@@ -12,7 +12,7 @@ recorder), usa el cálculo SMA simple original.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
@@ -41,6 +41,8 @@ class MarketContext:
     vol_regime: str = "normal"           # "expansion" | "contraccion" | "normal"
     htf_snap: object = None             # TechnicalSnapshot semanal | None
     ltf_snap: object = None             # TechnicalSnapshot intradiario | None
+    # v2.4 — Smart Money Concepts (SmcContext | None)
+    smc: object = None
 
 
 _MIN_ROWS  = 5
@@ -52,6 +54,7 @@ def compute_market_context(
     spot_history: Optional[pd.DataFrame],
     htf: Optional[pd.DataFrame] = None,   # OHLCV semanal (HTF)
     ltf: Optional[pd.DataFrame] = None,   # OHLCV intradiario (LTF)
+    symbol: str = "GGAL",                 # ticker del subyacente (para ADR lookup)
 ) -> MarketContext:
     """Calcula contexto de mercado a partir del historial de precios.
 
@@ -84,6 +87,33 @@ def compute_market_context(
     ctx.mtf_alignment = _mtf_alignment(ctx.trend, ctx.htf_trend, ctx.ltf_trend)
     if spot_history is not None and _OHLCV_COLS.issubset(set(spot_history.columns)):
         ctx.vol_regime = _vol_regime(spot_history)
+
+    # SMC context (v2.4) — solo si el toggle está activo
+    try:
+        from optionsdesk.config.settings import settings as _s
+        if getattr(_s, "smc_enabled", True):
+            from optionsdesk.signals.smc import analyze_smc as _analyze_smc
+            snap = getattr(ctx, "snap", None)
+            smc_ctx = _analyze_smc(
+                daily=spot_history if _OHLCV_COLS.issubset(set(spot_history.columns)) else None,
+                weekly=htf,
+                intraday=ltf,
+                snap=snap,
+            )
+            # Enriquecer con ADR/CCL (Fase 2)
+            if getattr(_s, "adr_ccl_enabled", False):
+                from optionsdesk.data.providers.adr import enrich_smc_with_adr as _adr_enrich
+                smc_ctx = _adr_enrich(smc_ctx, symbol)
+            ctx.smc = smc_ctx
+            # Enriquecer el note con la zona PDA
+            pda = getattr(smc_ctx, "pda", None)
+            if pda is not None:
+                pda_zone = getattr(pda, "zone", None)
+                if pda_zone:
+                    ctx.note = _build_note(ctx.trend, ctx.momentum_pct, ctx.confidence,
+                                           len(spot_history), pda_zone=pda_zone)
+    except Exception as _smc_exc:
+        logger.debug("SMC enrichment fallo: %s", _smc_exc)
 
     return ctx
 
@@ -162,13 +192,18 @@ def _extract_spots(df: pd.DataFrame) -> Optional[pd.Series]:
     return None
 
 
-def _build_note(trend: str, momentum_pct: float, confidence: str, n_days: int) -> str:
+def _build_note(trend: str, momentum_pct: float, confidence: str, n_days: int,
+                pda_zone: Optional[str] = None) -> str:
     direction  = {"alcista": "subiendo", "bajista": "bajando", "lateral": "lateral"}[trend]
     conf_label = {"alta": "alta confianza", "media": "confianza media", "baja": "confianza baja"}
-    return (
+    base = (
         f"GGAL {direction}  |  Momentum: {momentum_pct:+.1f}%  "
         f"({conf_label.get(confidence, confidence)}, {n_days} dias de historial)"
     )
+    if pda_zone:
+        _pz = {"premium": "PREMIUM (venta)", "discount": "DISCOUNT (compra)", "equilibrium": "equilibrio"}
+        base += f"  |  PDA: {_pz.get(pda_zone, pda_zone)}"
+    return base
 
 
 # ── Multi-timeframe helpers (v2.3) ────────────────────────────────────────────

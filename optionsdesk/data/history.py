@@ -9,6 +9,7 @@ Sin credenciales. Cachea en parquet. Fallback sintético si PyOBD falla o no hay
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -26,9 +27,87 @@ logger = logging.getLogger(__name__)
 # BYMA Open Data usa denominación con panel, no solo el ticker.
 _BYMA_SYMBOL: dict[str, str] = {
     "GGAL": "GGAL 24HS",
+    "YPFD": "YPFD 24HS",
+    "PAMP": "PAMP 24HS",
+    "BBAR": "BBAR 24HS",
+    "SUPV": "SUPV 24HS",
+    "COME": "COME 24HS",
+    "ALUA": "ALUA 24HS",
+    "TXAR": "TXAR 24HS",
+    "CEPU": "CEPU 24HS",
+    "EDN": "EDN 24HS",
+    "TGSU2": "TGSU2 24HS",
+    "TRAN": "TRAN 24HS",
+    "LOMA": "LOMA 24HS",
+    "BYMA": "BYMA 24HS",
+    "VALO": "VALO 24HS",
+    "MIRG": "MIRG 24HS",
 }
 
 _CACHE_STALENESS_DAYS = 4   # Refresca si el último dato tiene más de 4 días hábiles
+_SPOT_TAPE_PATH = Path("data/spot_tape.jsonl")
+_BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+
+def load_spot_tape(
+    path: Optional[Path] = None,
+    *,
+    now: Optional[datetime] = None,
+    max_age_hours: float = 8.0,
+) -> list[tuple[datetime, float]]:
+    """Carga observaciones reales de GGAL del día; nunca sintetiza precios."""
+    file = Path(path) if path is not None else _SPOT_TAPE_PATH
+    current = now or datetime.now(_BA_TZ)
+    cutoff = current - timedelta(hours=max_age_hours)
+    if not file.exists():
+        return []
+
+    samples: dict[str, tuple[datetime, float]] = {}
+    for raw_line in file.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(raw_line)
+            ts = datetime.fromisoformat(str(record["timestamp"]))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_BA_TZ)
+            ts = ts.astimezone(_BA_TZ)
+            spot = float(record["spot"])
+            if (
+                spot > 0
+                and cutoff <= ts <= current + timedelta(minutes=1)
+                and ts.date() == current.date()
+            ):
+                samples[ts.isoformat()] = (ts, spot)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return sorted(samples.values(), key=lambda sample: sample[0])
+
+
+def append_spot_tape(
+    spot: float,
+    source: str,
+    path: Optional[Path] = None,
+    *,
+    now: Optional[datetime] = None,
+    min_interval_s: float = 5.0,
+) -> list[tuple[datetime, float]]:
+    """Persiste una muestra real de spot y devuelve el tape vivo de la rueda."""
+    file = Path(path) if path is not None else _SPOT_TAPE_PATH
+    current = now or datetime.now(_BA_TZ)
+    samples = load_spot_tape(file, now=current)
+    if float(spot or 0.0) <= 0:
+        return samples
+    if samples and (current - samples[-1][0]).total_seconds() < min_interval_s:
+        return samples
+
+    file.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": current.astimezone(_BA_TZ).isoformat(timespec="seconds"),
+        "spot": float(spot),
+        "source": str(source),
+    }
+    with file.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return load_spot_tape(file, now=current)
 
 
 def tape_ohlc(samples: list[tuple[datetime, float]], rule: str = "1min") -> pd.DataFrame:

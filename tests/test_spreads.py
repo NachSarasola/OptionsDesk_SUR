@@ -27,7 +27,7 @@ SPOT    = 8300.0
 ZERO_COSTS = CostModel(
     stock_commission_pct=0.0, option_commission_pct=0.0,
     stock_market_fee_pct=0.0, option_market_fee_pct=0.0,
-    exercise_fee_pct=0.0, iva_rate=0.0,
+    exercise_fee_pct=0.0, exercise_market_fee_pct=0.0, iva_rate=0.0,
 )
 
 

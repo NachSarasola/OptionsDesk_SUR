@@ -43,14 +43,17 @@ class BymaOpenProvider(MarketDataProvider):
             logger.warning("BYMA Open Data falló: %s", e)
             return None
 
-    def get_spot(self) -> Optional[Quote]:
-        data = self._get("equities", params={"symbol": "GGAL"})
+    def get_quote(self, symbol: str) -> Optional[Quote]:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return None
+        data = self._get("equities", params={"symbol": symbol})
         if not data:
             return None
         try:
             item = data[0] if isinstance(data, list) else data
             return Quote(
-                symbol="GGAL",
+                symbol=symbol,
                 bid=float(item.get("bidPrice", 0) or 0),
                 ask=float(item.get("offerPrice", 0) or 0),
                 last=float(item.get("closingPrice", item.get("settlementPrice", 0)) or 0),
@@ -58,8 +61,11 @@ class BymaOpenProvider(MarketDataProvider):
                 timestamp=datetime.now(),
             )
         except (KeyError, IndexError, TypeError) as e:
-            logger.warning("No se pudo parsear el spot de BYMA: %s", e)
+            logger.warning("No se pudo parsear %s de BYMA: %s", symbol, e)
             return None
+
+    def get_spot(self) -> Optional[Quote]:
+        return self.get_quote("GGAL")
 
     def get_options_chain(self) -> Optional[OptionsChain]:
         spot = self.get_spot()

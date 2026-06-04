@@ -13,6 +13,22 @@ from optionsdesk.signals.directional_ideas import (
     _parse_strike,
     build_directional_idea,
 )
+from optionsdesk.signals.technical import FairValueGap, OrderBlock, TechnicalSnapshot
+
+
+def _make_snap(
+    trend: str = "ALCISTA",
+    bos: str | None = "BOS_UP",
+    fvgs: list | None = None,
+    order_block: OrderBlock | None = None,
+    atr_pct: float = 2.5,
+) -> TechnicalSnapshot:
+    return TechnicalSnapshot(
+        trend=trend, rsi=60.0, atr_pct=atr_pct,
+        sma_fast=0.0, sma_slow=0.0, momentum=3.0, read="test",
+        signal_strength="fuerte", bos=bos,
+        fvgs=fvgs or [], order_block=order_block,
+    )
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -162,6 +178,78 @@ def test_max_loss_equals_total_cost(mock_days):
     idea  = build_directional_idea(ctx, chain, 8500.0)
     if idea is not None:
         assert idea.max_loss_ars == pytest.approx(idea.total_cost_ars)
+
+
+# ── v2.7: target/stop/RR/confluencia SMC ──────────────────────────────────────
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_call_target_always_clears_breakeven(mock_days):
+    """El objetivo de un call nunca puede quedar por debajo del break-even."""
+    ctx   = _make_context(trend="alcista", momentum_pct=3.5, signal_strength="fuerte")
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0)
+    assert idea is not None
+    assert idea.target_spot > idea.breakeven
+
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_put_target_always_clears_breakeven(mock_days):
+    ctx   = _make_context(trend="bajista", momentum_pct=-3.5, signal_strength="fuerte")
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0)
+    assert idea is not None
+    assert idea.target_spot < idea.breakeven
+
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_fvg_below_breakeven_is_not_used_as_target(mock_days):
+    """Reproduce el bug del screenshot: un FVG pegado al spot (por debajo del BE)
+    no debe usarse como objetivo; cae al fallback BE + k·ATR."""
+    # FVG alcista justo en el spot (mid 8505), muy por debajo del BE (~8705)
+    fvg  = FairValueGap(type="bullish", high=8510.0, low=8500.0, filled=False)
+    snap = _make_snap(fvgs=[fvg], bos="BOS_UP")
+    ctx  = _make_context(trend="alcista", momentum_pct=3.5, signal_strength="fuerte")
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0, snap=snap)
+    assert idea is not None
+    assert idea.target_spot > idea.breakeven
+    assert "FVG" not in idea.rational.split("Objetivo:")[1].split("Stop:")[0]
+
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_low_rr_setup_returns_none(mock_days):
+    """Objetivo apenas sobre el BE + stop estructural lejano (capado) → R/R < 1.5 → None."""
+    fvg  = FairValueGap(type="bullish", high=8720.0, low=8700.0, filled=False)  # mid 8710 ~ BE
+    ob   = OrderBlock(type="bullish", high=7100.0, low=7000.0)                  # stop capado a 2×ATR
+    snap = _make_snap(fvgs=[fvg], order_block=ob, bos="BOS_UP")
+    ctx  = _make_context(trend="alcista", momentum_pct=3.5, signal_strength="fuerte")
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0, snap=snap)
+    assert idea is None
+
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_mtf_conflict_returns_none(mock_days):
+    ctx = _make_context(trend="alcista", momentum_pct=3.5, signal_strength="fuerte")
+    ctx.mtf_alignment = "conflicto"
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0)
+    assert idea is None
+
+
+@patch("optionsdesk.signals.directional_ideas.days_to_expiry", side_effect=_mock_days)
+def test_confluence_lists_aligned_factors(mock_days):
+    fvg  = FairValueGap(type="bullish", high=9100.0, low=9000.0, filled=False)  # mid 9050 > BE
+    ob   = OrderBlock(type="bullish", high=8350.0, low=8300.0)
+    snap = _make_snap(fvgs=[fvg], order_block=ob, bos="BOS_UP")
+    ctx  = _make_context(trend="alcista", momentum_pct=3.5, signal_strength="fuerte")
+    chain = _make_chain(spot=8500.0)
+    idea  = build_directional_idea(ctx, chain, 8500.0, snap=snap)
+    assert idea is not None
+    assert idea.rr_ratio >= 1.5
+    assert "BOS en dirección" in idea.confluence
+    assert "objetivo en FVG de liquidez" in idea.confluence
+    assert "señal fuerte" in idea.confluence
 
 
 # ── v2.6: _naked_pop fallback cap ─────────────────────────────────────────────

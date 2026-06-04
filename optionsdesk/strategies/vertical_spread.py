@@ -9,7 +9,6 @@ Con dos spreads bid-ask amplios, el edge se acumula — el filtro es estricto.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -89,7 +88,7 @@ class VerticalSpreadScanner:
         hi_band = S * (1 + self._cfg.spot_band_pct)
 
         for sym, quote in chain.options.items():
-            contract = parse_option_symbol(sym, effective_calendar)
+            contract = parse_option_symbol(sym, effective_calendar, spot_hint=S)
             if contract is None:
                 continue
             days = contract.days_to_expiry

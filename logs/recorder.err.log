@@ -1,0 +1,3 @@
+INFO:optionsdesk.data.providers.iol:IOL: token obtenido via login
+INFO:optionsdesk.data.providers.iol:IOLProvider conectado
+INFO:__main__:Recorder iniciado (cadena: 60s, spot tape: 60s).

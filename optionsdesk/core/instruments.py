@@ -73,8 +73,7 @@ def parse_option_symbol(
     if not m:
         return None
 
-    # Underlying fijo (GGAL por ahora)
-    underlying = "GGAL"
+    # Usamos default GGAL para opciones
     otype = OptionType.CALL if m.group("otype").upper() == "C" else OptionType.PUT
     strike = float(m.group("strike").replace(",", "."))
 

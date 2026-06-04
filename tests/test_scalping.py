@@ -1,5 +1,6 @@
 import pytest
 from datetime import datetime, timedelta, date
+from optionsdesk.config.costs import CostModel
 from optionsdesk.core.greeks_engine import OptionGreeks
 from optionsdesk.data.providers.base import OptionsChain, Quote
 from optionsdesk.signals.scalping import (
@@ -91,7 +92,19 @@ def test_scan_momentum_lateral(mock_greeks):
     assert len(signals) == 0
 
 
-def test_wave_ride_buys_calls_with_confirmed_bullish_wave(mock_greeks):
+def test_wave_ride_buys_calls_with_confirmed_bullish_wave(mock_greeks, monkeypatch):
+    monkeypatch.setattr(
+        "optionsdesk.signals.scalping.DEFAULT_COSTS",
+        CostModel(
+            stock_commission_pct=0.0,
+            option_commission_pct=0.0,
+            stock_market_fee_pct=0.0,
+            option_market_fee_pct=0.0,
+            exercise_fee_pct=0.0,
+            exercise_market_fee_pct=0.0,
+            iva_rate=0.0,
+        ),
+    )
     snap = MockSnap("ALCISTA", 3.2, rsi=61, bos="BOS_UP", vol_confirms=True, macd_hist=12.0)
     signals = scan_wave_ride(mock_greeks, snap, momentum_threshold=1.0)
 
@@ -150,6 +163,17 @@ def test_volatility_breakout_arms_both_sides_when_direction_not_confirmed(mock_g
     assert {s.action for s in signals} >= {"BUY_CALL", "BUY_PUT"}
     assert all(s.confidence == "watchlist" for s in signals)
     assert all("esperando_breakout_direccion" in s.risk_flags for s in signals)
+
+
+def test_volatility_breakout_accepts_modest_intraday_structure(mock_greeks):
+    snap = MockSnap("ALCISTA", 0.22, rsi=58, bos="BOS_UP", vol_confirms=False, atr_pct=0.12)
+    snap.momentum_threshold_pct = 0.18
+
+    signals = scan_volatility_breakout(mock_greeks, snap, realized_vol=0.40)
+
+    assert signals
+    assert signals[0].signal_type == "VOL_BREAKOUT"
+    assert signals[0].action == "BUY_CALL"
 
 
 def test_stale_liquidity_reason_is_not_duplicated(mock_greeks):
@@ -225,9 +249,21 @@ def test_sizing_respects_capital_budget(mock_greeks):
     assert signals[0].suggested_lots >= 1
 
 
-def test_insufficient_capital_blocks_actionable_signal(mock_greeks):
+def test_insufficient_capital_blocks_when_auto_sizing_required(mock_greeks):
     snap = MockSnap("ALCISTA", 2.5, bos="BOS_UP")
-    signals = scan_momentum(mock_greeks, snap, momentum_threshold=1.0, capital=1_000.0)
+    cfg = {
+        "max_spread": 22.0,
+        "min_rr": 1.2,
+        "max_age_s": 90.0,
+        "min_action_delta": 0.25,
+        "max_action_moneyness": 14.0,
+        "entry_aggression": 0.35,
+        "min_score_actionable": 48.0,
+        "min_pop": 0.10,
+        "max_breakeven_move_pct": 0.65,
+        "require_capital": True,
+    }
+    signals = scan_momentum(mock_greeks, snap, momentum_threshold=1.0, capital=1_000.0, profile_cfg=cfg)
 
     assert len(signals) > 0
     assert signals[0].suggested_lots == 0
@@ -423,13 +459,13 @@ def _rank_sig(symbol: str, pop: float, ev: float, cost_to_target: float = 5.0) -
     )
 
 
-def test_signal_rank_prioritizes_highest_viable_pop():
-    low_pop_high_score = _rank_sig("LOWPOP", pop=0.55, ev=900.0, cost_to_target=2.0)
-    low_pop_high_score.score = 95.0
-    high_pop = _rank_sig("HIGHPOP", pop=0.68, ev=300.0, cost_to_target=8.0)
-    ranked = sorted([low_pop_high_score, high_pop], key=_signal_rank, reverse=True)
+def test_signal_rank_prioritizes_execution_not_pseudo_pop():
+    better_execution = _rank_sig("BETTER_EXEC", pop=0.55, ev=900.0, cost_to_target=2.0)
+    better_execution.score = 95.0
+    higher_pop = _rank_sig("HIGHPOP", pop=0.68, ev=300.0, cost_to_target=8.0)
+    ranked = sorted([better_execution, higher_pop], key=_signal_rank, reverse=True)
 
-    assert ranked[0].symbol == "HIGHPOP"
+    assert ranked[0].symbol == "BETTER_EXEC"
 
 
 def test_spot_tape_pulse_requires_enough_live_observations_and_span():
@@ -442,6 +478,19 @@ def test_spot_tape_pulse_requires_enough_live_observations_and_span():
     assert pulse.confirmed
     assert pulse.direction == "BULL"
     assert pulse.observations == 5
+
+
+def test_spot_tape_pulse_rejects_choppy_tape_despite_net_move():
+    """Cinta que oscila con violencia pero termina +0.2%: el first-vs-last la leería
+    BULL; el Kaufman Efficiency Ratio la rechaza por chop (baja eficiencia)."""
+    start = datetime(2026, 6, 1, 12, 0)
+    chop = [4000.0, 4030.0, 4005.0, 4035.0, 4008.0]  # net +0.2% pero camino enorme
+    samples = [(start + timedelta(seconds=i * 20), px) for i, px in enumerate(chop)]
+
+    pulse = compute_spot_tape_pulse(samples)
+    assert pulse.direction == "BULL"        # hay deriva neta positiva
+    assert pulse.efficiency < 0.35          # pero la cinta es caótica
+    assert not pulse.confirmed              # → no se confirma
 
 
 def test_verdict_waits_without_confirmed_live_pulse():
@@ -458,7 +507,7 @@ def test_verdict_waits_without_confirmed_live_pulse():
     assert "sin_confirmacion_intradia_live" in verdict.blockers
 
 
-def test_verdict_selects_highest_pop_viable_buy():
+def test_verdict_selects_best_ranked_viable_buy_without_pop_bias():
     low = _rank_sig("LOW", pop=0.55, ev=900.0)
     high = _rank_sig("HIGH", pop=0.68, ev=300.0)
     verdict = build_scalp_verdict(
@@ -470,7 +519,7 @@ def test_verdict_selects_highest_pop_viable_buy():
     )
 
     assert verdict.decision == "BUY_CALL_NOW"
-    assert verdict.signal is high
+    assert verdict.signal is low
 
 
 def test_scan_all_overnight_is_explicit_opt_in(monkeypatch):
@@ -529,7 +578,7 @@ def test_soft_score_flag_does_not_block_actionable_signal(mock_greeks, monkeypat
     assert out.blocking_flags == []
 
 
-def test_negative_ev_blocks_even_with_high_pop(mock_greeks, monkeypatch):
+def test_negative_ev_is_warning_not_ticket_gate(mock_greeks, monkeypatch):
     def fake_plan(*args, **kwargs):
         return {
             "entry": 100.0,
@@ -554,7 +603,8 @@ def test_negative_ev_blocks_even_with_high_pop(mock_greeks, monkeypatch):
     out = _finalize_signal(sig, g, snap=None, capital=None, positions=None)
 
     assert out.confidence == "watchlist"
-    assert "ev_no_positivo" in out.blocking_flags
+    assert "ev_no_positivo" in out.warning_flags
+    assert "ev_no_positivo" not in out.blocking_flags
 
 
 def test_extreme_spread_is_hard_block(mock_greeks, monkeypatch):
@@ -584,3 +634,31 @@ def test_extreme_spread_is_hard_block(mock_greeks, monkeypatch):
 
     assert out.confidence == "watchlist"
     assert any(flag.startswith("spread_extremo") for flag in out.blocking_flags)
+
+
+def test_rr_below_one_is_hard_block(mock_greeks, monkeypatch):
+    def fake_plan(*args, **kwargs):
+        return {
+            "entry": 100.0,
+            "sl": 90.0,
+            "tp": 105.0,
+            "rr": 0.5,
+            "planned_risk_ars": 1050.0,
+            "max_loss_ars": 10050.0,
+            "fees_ars": 30.0,
+            "spread_cost_ars": 0.0,
+            "breakeven_move_pct": 0.10,
+            "underlying_stop": 3980.0,
+            "underlying_target": 4040.0,
+            "entry_style": "test",
+        }
+
+    monkeypatch.setattr("optionsdesk.signals.scalping._trade_plan_detail", fake_plan)
+    monkeypatch.setattr("optionsdesk.signals.scalping._estimate_long_pop", lambda *args, **kwargs: 0.70)
+    g = mock_greeks["GFGC4000A"]
+    sig = _rank_sig("GFGC4000A", pop=0.70, ev=0.0)
+
+    out = _finalize_signal(sig, g, snap=None, capital=None, positions=None)
+
+    assert out.confidence == "watchlist"
+    assert "rr_inferior_a_1" in out.blocking_flags

@@ -125,6 +125,8 @@ class IOLProvider(MarketDataProvider):
         self._last_error = ""
         self._options_seen = 0
         self._options_tradeable = 0
+        self._options_listing: list[dict] = []
+        self._options_listing_monotonic = 0.0
 
     def connect(self) -> None:
         if not settings.iol_user or not settings.iol_password:
@@ -142,10 +144,23 @@ class IOLProvider(MarketDataProvider):
     def is_connected(self) -> bool:
         return self._connected and self._token_mgr is not None
 
+    def get_token_manager(self) -> _TokenManager:
+        """Devuelve el gestor de token vivo para reusar la sesion (p.ej. operar)."""
+        if not self._token_mgr:
+            raise RuntimeError("IOLProvider no conectado. Llama connect() primero.")
+        return self._token_mgr
+
     def get_health(self) -> MarketDataHealth:
+        connected = self.is_connected()
+        coverage = (
+            self._options_tradeable / self._options_seen * 100.0
+            if self._options_seen > 0
+            else 0.0
+        )
+        provisional = connected and settings.iol_provisional_tickets_enabled
         return MarketDataHealth(
             source="IOL",
-            connected=self.is_connected(),
+            connected=connected,
             last_success_ts=self._last_success_ts,
             last_error=self._last_error,
             last_latency_ms=self._last_latency_ms,
@@ -154,13 +169,43 @@ class IOLProvider(MarketDataProvider):
             retries=self._retry_count,
             options_seen=self._options_seen,
             options_tradeable=self._options_tradeable,
+            ticket_capable=provisional,
+            warmup_complete=connected,
+            coverage_pct=round(coverage, 2),
+            blocking_reason="" if provisional else "IOL provisional deshabilitado",
+            operational_mode="IOL_PROVISIONAL" if provisional else "RADAR_IOL",
         )
 
     def get_spot(self) -> Optional[Quote]:
-        data = self._get(f"{self._MARKET}/Titulos/{self._UNDERLYING}/Cotizacion")
+        return self.get_quote(self._UNDERLYING)
+
+    def get_quote(self, symbol: str) -> Optional[Quote]:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return None
+        data = self._get(f"{self._MARKET}/Titulos/{symbol}/Cotizacion")
         if not isinstance(data, dict):
             return None
-        return _parse_quote(self._UNDERLYING, data)
+        return _parse_quote(symbol, data, source="IOL_REST")
+
+    def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        clean = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
+        if not clean:
+            return {}
+        quotes: dict[str, Quote] = {}
+        max_workers = min(8, len(clean))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self.get_quote, symbol): symbol for symbol in clean}
+            for future in concurrent.futures.as_completed(futures):
+                symbol = futures[future]
+                try:
+                    quote = future.result()
+                except Exception as exc:
+                    logger.debug("IOL: get_quote fallo para %s: %s", symbol, exc)
+                    continue
+                if quote is not None:
+                    quotes[quote.symbol.upper()] = quote
+        return quotes
 
     def get_options_chain(self) -> Optional[OptionsChain]:
         spot = self.get_spot()
@@ -175,14 +220,14 @@ class IOLProvider(MarketDataProvider):
             self._options_tradeable = 0
             return None
 
-        data = self._get(f"{self._MARKET}/Titulos/{self._UNDERLYING}/Opciones")
+        data = self._get_options_listing()
         if not isinstance(data, list):
             self._options_seen = 0
             self._options_tradeable = 0
             return None
 
         self._options_seen = len(data)
-        symbols: list[str] = []
+        selected_items: list[tuple[float, str, dict]] = []
         observed_expiry_calendar: dict[str, date] = {}
 
         from optionsdesk.core.instruments import parse_option_symbol
@@ -206,7 +251,6 @@ class IOLProvider(MarketDataProvider):
                     logger.debug("IOL: vencimiento invalido para %s: %s", sym, expiry_raw)
             contract = parse_option_symbol(sym, {**dummy_cal, **observed_expiry_calendar})
             if not contract:
-                symbols.append(sym)
                 continue
 
             strike = contract.strike
@@ -216,29 +260,32 @@ class IOLProvider(MarketDataProvider):
                 strike *= 10.0
 
             if spot_px * 0.5 <= strike <= spot_px * 1.5:
-                symbols.append(sym)
+                selected_items.append((abs(strike - spot_px), sym, item))
 
         opts: dict[str, Quote] = {}
+        for _, sym, item in selected_items:
+            # La cadena ya incluye la cotizacion completa de cada opcion.
+            # Cuando IOL la completa, evita una llamada REST adicional.
+            q = _parse_quote(sym, item, source="IOL_LISTING")
+            if self._is_option_quote_usable(q, spot):
+                opts[q.symbol] = q
 
-        def fetch_quote(sym: str) -> Optional[Quote]:
-            res = self._get(f"{self._MARKET}/Titulos/{sym}/Cotizacion")
-            if not isinstance(res, dict):
-                return None
-            q = _parse_quote(sym, res)
-            if q is None:
-                return None
-            if q.volume > 50_000_000 and abs(q.last - spot.last) < spot.last * 0.05:
-                return None
-            if q.last == 0 and q.bid == 0 and q.ask == 0:
-                return None
-            return q
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(fetch_quote, sym): sym for sym in symbols}
-            for future in concurrent.futures.as_completed(futures):
-                q = future.result()
-                if q is not None:
-                    opts[q.symbol] = q
+        # En la practica, el listado agregado de IOL puede venir sin puntas aun
+        # durante la rueda. Recupera solo un radar ATM acotado para mantener el
+        # consumo mensual controlado hasta disponer de Primary WebSocket.
+        limit = max(settings.iol_option_quotes_per_cycle, 0)
+        nearest = sorted(selected_items, key=lambda row: (row[0], row[1]))[:limit]
+        if nearest:
+            max_workers = min(8, len(nearest))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(self._get_option_quote, sym): sym
+                    for _, sym, _ in nearest
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    q = future.result()
+                    if self._is_option_quote_usable(q, spot):
+                        opts[q.symbol] = q
 
         self._options_tradeable = sum(1 for q in opts.values() if q.bid > 0 and q.ask > 0)
         return OptionsChain(
@@ -247,6 +294,32 @@ class IOLProvider(MarketDataProvider):
             options=opts,
             expiry_calendar=observed_expiry_calendar,
         )
+
+    def _get_options_listing(self) -> Optional[list[dict]]:
+        ttl_s = max(settings.iol_options_list_ttl_s, 0)
+        if (
+            self._options_listing
+            and time.monotonic() - self._options_listing_monotonic < ttl_s
+        ):
+            return self._options_listing
+        data = self._get(f"{self._MARKET}/Titulos/{self._UNDERLYING}/Opciones")
+        if isinstance(data, list):
+            self._options_listing = data
+            self._options_listing_monotonic = time.monotonic()
+            return data
+        return None
+
+    def _get_option_quote(self, symbol: str) -> Optional[Quote]:
+        data = self._get(f"{self._MARKET}/Titulos/{symbol}/Cotizacion")
+        return _parse_quote(symbol, data, source="IOL_REST") if isinstance(data, dict) else None
+
+    @staticmethod
+    def _is_option_quote_usable(q: Optional[Quote], spot: Quote) -> bool:
+        if q is None:
+            return False
+        if q.volume > 50_000_000 and abs(q.last - spot.last) < spot.last * 0.05:
+            return False
+        return not (q.last == 0 and q.bid == 0 and q.ask == 0)
 
     def get_caucion_tna(self, days: int = 30) -> Optional[float]:
         for panel in ("general", "todos"):
@@ -317,7 +390,16 @@ class IOLProvider(MarketDataProvider):
                 logger.warning("IOL GET %s fallo: %s", path, exc)
                 return None
 
-def _parse_quote(symbol: str, data: dict) -> Optional[Quote]:
+def _parse_datetime(value) -> Optional[datetime]:
+    if not value or str(value).startswith("0001-01-01"):
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_quote(symbol: str, data: dict, *, source: str = "IOL_REST") -> Optional[Quote]:
     """Construye un Quote desde la respuesta JSON de IOL."""
     try:
         qdata = data.get("cotizacion") if isinstance(data.get("cotizacion"), dict) else data
@@ -333,20 +415,19 @@ def _parse_quote(symbol: str, data: dict) -> Optional[Quote]:
 
         ultimo = qdata.get("ultimo")
         cierre_anterior = float(qdata.get("cierreAnterior") or 0)
+        market_ts = None
         if isinstance(ultimo, dict):
             last = float(ultimo.get("precio") or 0)
-            ts_str = ultimo.get("fecha")
+            market_ts = _parse_datetime(ultimo.get("fecha"))
         else:
             ops = int(qdata.get("cantidadOperaciones") or 0)
-            if ops > 0:
-                last = float(
-                    qdata.get("ultimoPrecio")
-                    or (ultimo if isinstance(ultimo, (int, float)) else 0)
-                    or 0
-                )
-            else:
-                last = 0.0
-            ts_str = qdata.get("fechaHora")
+            last_candidate = float(
+                qdata.get("ultimoPrecio")
+                or (ultimo if isinstance(ultimo, (int, float)) else 0)
+                or 0
+            )
+            last = last_candidate if (ops > 0 or last_candidate > 0) else 0.0
+            market_ts = _parse_datetime(qdata.get("fechaHora"))
 
         if symbol.upper() == "GGAL" and last <= 0:
             last = float(qdata.get("ultimoPrecio") or cierre_anterior or 0)
@@ -355,12 +436,8 @@ def _parse_quote(symbol: str, data: dict) -> Optional[Quote]:
         if last <= 0 and cierre_anterior < 500:
             last = cierre_anterior
 
-        timestamp = datetime.now()
-        if ts_str and not str(ts_str).startswith("0001-01-01"):
-            try:
-                timestamp = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-            except Exception:
-                pass
+        received_at = datetime.now().astimezone()
+        book_ts = _parse_datetime(qdata.get("fechaHora")) or received_at
 
         volume = float(qdata.get("volumenNominal") or qdata.get("volumeNominal") or 0)
 
@@ -370,9 +447,13 @@ def _parse_quote(symbol: str, data: dict) -> Optional[Quote]:
             ask=ask,
             last=last,
             volume=volume,
-            timestamp=timestamp,
+            timestamp=received_at,
             bid_size=bid_size,
             ask_size=ask_size,
+            source=source,
+            received_at=received_at,
+            market_ts=market_ts,
+            book_ts=book_ts,
         )
     except Exception as exc:
         logger.debug("IOL: no se pudo parsear quote para %s: %s", symbol, exc)

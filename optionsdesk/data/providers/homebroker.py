@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Optional
 
 from optionsdesk.config.settings import settings
-from optionsdesk.data.providers.base import MarketDataProvider, OptionsChain, Quote
+from optionsdesk.data.providers.base import MarketDataHealth, MarketDataProvider, OptionsChain, Quote
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class HomeBrokerProvider(MarketDataProvider):
         )
         self._hb.online.connect()
         self._hb.online.subscribe_options()
-        self._hb.online.subscribe_securities("general", "48hs")
+        self._hb.online.subscribe_securities("bluechips", settings.hb_settlement)
         self._hb.online.subscribe_repos("1dia")
         self._connected = True
         logger.info("HomeBrokerProvider conectado a Bull Market.")
@@ -80,6 +80,23 @@ class HomeBrokerProvider(MarketDataProvider):
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def get_health(self) -> MarketDataHealth:
+        with self._lock:
+            options = list(self._options_data.values())
+        return MarketDataHealth(
+            source="HOMEBROKER",
+            connected=self.is_connected() and not self.is_stale(),
+            last_success_ts=(
+                datetime.fromtimestamp(self._last_update)
+                if self._last_update > 0
+                else None
+            ),
+            options_seen=len(options),
+            options_tradeable=sum(
+                1 for quote in options if quote["bid"] > 0 and quote["ask"] > 0
+            ),
+        )
 
     # ── Callbacks (llamados desde el thread de pyhomebroker) ──────────────────
 
@@ -147,6 +164,8 @@ class HomeBrokerProvider(MarketDataProvider):
         Con interval=15s, umbral=60s significa que el WS lleva al menos 4 ciclos sin
         actualizar — señal clara de desconexión silenciosa.
         """
+        if not self._connected:
+            return True
         if self._last_update == 0.0:
             return False   # nunca recibió datos aún (startup normal)
         return (time.time() - self._last_update) > threshold_s

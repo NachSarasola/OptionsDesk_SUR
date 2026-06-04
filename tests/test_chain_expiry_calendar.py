@@ -1,11 +1,21 @@
 from datetime import date, datetime, timedelta
 
+from optionsdesk.config.costs import CostModel
 from optionsdesk.core.benchmark import ZERO_BENCHMARK
 from optionsdesk.data.providers.base import OptionsChain, Quote
 from optionsdesk.data.providers.demo import DemoProvider
-from optionsdesk.strategies.covered_call import CoveredCallScanner
-from optionsdesk.strategies.short_put import ShortPutScanner
+from optionsdesk.strategies.covered_call import CoveredCallConfig, CoveredCallScanner
+from optionsdesk.strategies.short_put import ShortPutConfig, ShortPutScanner
 from optionsdesk.strategies.vertical_spread import VerticalSpreadScanner
+
+ZERO_COSTS = CostModel(
+    stock_commission_pct=0,
+    option_commission_pct=0,
+    stock_market_fee_pct=0,
+    option_market_fee_pct=0,
+    exercise_fee_pct=0,
+    exercise_market_fee_pct=0,
+)
 
 
 def _quote(symbol: str, bid: float, ask: float, last: float | None = None) -> Quote:
@@ -31,8 +41,14 @@ def test_rate_scanners_use_observed_calendar_when_local_calendar_is_empty():
         expiry_calendar={"JU": expiry},
     )
 
-    assert CoveredCallScanner(expiry_calendar={}).scan(chain, ZERO_BENCHMARK)
-    assert ShortPutScanner(expiry_calendar={}).scan(chain, ZERO_BENCHMARK)
+    assert CoveredCallScanner(
+        config=CoveredCallConfig(cost_model=ZERO_COSTS),
+        expiry_calendar={},
+    ).scan(chain, ZERO_BENCHMARK)
+    assert ShortPutScanner(
+        config=ShortPutConfig(cost_model=ZERO_COSTS),
+        expiry_calendar={},
+    ).scan(chain, ZERO_BENCHMARK)
 
 
 def test_vertical_spread_uses_observed_calendar_when_local_calendar_is_empty():

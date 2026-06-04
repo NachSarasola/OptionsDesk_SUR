@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from typing import Optional
@@ -96,6 +96,9 @@ class Recommendation:
     light: str                             # "verde", "amarillo", "rojo"
     headline: str
     plain_explanation: str
+    intention: str
+    win_scenario: str
+    lose_scenario: str
     action_steps: list[str]
     success_probability: float             # 0–1
     expected_profit_ars: Optional[float]   # None si no se pasó capital
@@ -173,6 +176,15 @@ def _score(result: RateResult, profile: RiskProfile) -> float:
     prob_f = _probability(result)
     liq_f = 1.0 if result.is_liquid else 0.4
 
+    # IV-rank timing (vendedor de prima): vender cuando la IV está históricamente
+    # cara. iv_rank 0..100; >50 sube el score, <50 lo baja. ±6pts, no es gate.
+    # Si no hay historial suficiente, iv_rank_pct es None y no afecta nada.
+    iv_rank_boost = 0.0
+    if result.vol_edge is not None:
+        ivr = getattr(result.vol_edge, "iv_rank_pct", None)
+        if ivr is not None:
+            iv_rank_boost = (float(ivr) - 50.0) / 50.0 * 0.06
+
     raw = (
         w["ev"] * ev_f
         + w["vol"] * vol_f
@@ -180,6 +192,7 @@ def _score(result: RateResult, profile: RiskProfile) -> float:
         + w["probability"] * prob_f
         + w["liquidity"] * liq_f
     )
+    raw = min(max(raw + iv_rank_boost, 0.0), 1.0)
 
     # Bonus delta band: +5pts cuando el delta de la opción escrita cae en la
     # banda objetivo del perfil (no es gate — no puede forzar la eliminación).
@@ -223,42 +236,80 @@ def _headline(result: RateResult, score: float) -> str:
 
 
 def _explain(result: RateResult, prob: float, caucion_tna: float) -> str:
+    """Una línea de por qué esta opción. Conciso, comparativo, accionable."""
     breakeven = result.spot * (1.0 - result.cushion_pct / 100.0)
+    spread_vs_caucion = result.tna_pct - caucion_tna
+    edge_txt = (
+        f"+{spread_vs_caucion:.1f}pp sobre caución"
+        if spread_vs_caucion > 0
+        else f"{spread_vs_caucion:.1f}pp vs caución"
+    )
+    # Separador "  ·  " reservado para el texto base.
+    # Las notas SMC se agregan con " | " en _build_recommendation para que el
+    # dashboard pueda separarlas al renderizar tags de contexto.
     if result.strategy == "COVERED_CALL":
         return (
-            f"Compras GGAL (~${result.spot:,.0f}) y vendes el call {result.symbol}. "
-            f"Si en {result.days} dias GGAL cierra arriba de ${result.strike:,.0f} "
-            f"— algo con ~{prob * 100:.0f}% de probabilidad — "
-            f"cobras {result.tna_pct:.1f}% anual, contra {caucion_tna:.1f}% de la caucion. "
-            f"Si baja, tenes un colchon de {result.cushion_pct:.1f}%: "
-            f"GGAL puede caer hasta ${breakeven:,.0f} sin perder plata."
+            f"Call {result.symbol} K=${result.strike:,.0f} · vence {result.days}d  ·  "
+            f"TNA {result.tna_pct:.1f}% ({edge_txt})  ·  "
+            f"Colchon {result.cushion_pct:.1f}% hasta ${breakeven:,.0f}  ·  "
+            f"Prob. {prob*100:.0f}% de cobrar prima completa"
         )
     return (
-        f"Inmovilizas efectivo como garantia y vendes el put {result.symbol}. "
-        f"Si en {result.days} dias GGAL cierra arriba de ${result.strike:,.0f} "
-        f"— algo con ~{prob * 100:.0f}% de probabilidad — "
-        f"te quedas con la prima: {result.tna_pct:.1f}% anual "
-        f"(vs {caucion_tna:.1f}% de caucion). "
-        f"Si cae por debajo, compras GGAL a ${breakeven:,.0f} efectivo (ya neto de prima)."
+        f"Put {result.symbol} K=${result.strike:,.0f} · vence {result.days}d  ·  "
+        f"TNA {result.tna_pct:.1f}% ({edge_txt})  ·  "
+        f"Colchon {result.cushion_pct:.1f}% hasta ${breakeven:,.0f}  ·  "
+        f"Prob. {prob*100:.0f}% — si bajan a K compras GGAL barato"
     )
+
+def _intention(result: RateResult) -> str:
+    return "Alcista / Neutral (Se beneficia si la accion sube o se mantiene estable)."
+
+def _win_scenario(result: RateResult) -> str:
+    if result.strategy == "COVERED_CALL":
+        return f"Ganas si GGAL cierra por encima de ${result.strike:,.0f} al vencimiento. Obtienes la rentabilidad maxima de la operacion."
+    return f"Ganas si GGAL cierra por encima de ${result.strike:,.0f} al vencimiento. Te quedas con el 100% de la prima cobrada sin comprar la accion."
+
+def _lose_scenario(result: RateResult) -> str:
+    breakeven = result.spot * (1.0 - result.cushion_pct / 100.0)
+    if result.strategy == "COVERED_CALL":
+        return f"Pierdes si GGAL cae fuertemente y perfora los ${breakeven:,.0f} (tu colchon del {result.cushion_pct:.1f}%). La perdida acompaña la caida de la accion a partir de ese punto."
+    return f"Pierdes si GGAL cae fuertemente y perfora los ${breakeven:,.0f}. Se te obligara a comprar la accion a un costo neto mayor al precio de mercado en ese momento."
 
 
 def _action_steps(result: RateResult, contracts: int) -> list[str]:
-    expiry_str = result.expiration.strftime("%d/%m/%Y")
+    expiry_str   = result.expiration.strftime("%d/%m/%Y")
+    breakeven    = result.spot * (1.0 - result.cushion_pct / 100.0)
+    n_contracts  = max(contracts, 1)
+    lote_str     = f"{n_contracts} contrato{'s' if n_contracts > 1 else ''}"
+    prima_total  = result.premium * n_contracts * 100
+
     if result.strategy == "COVERED_CALL":
+        # Step 1 = la orden concreta lista para ejecutar en el broker
+        step1 = (
+            f"VENDER {lote_str} call {result.symbol}  "
+            f"precio limite ${result.premium:,.2f}  "
+            f"(prima total ~${prima_total:,.0f})"
+        )
         return [
-            f"Compra {contracts * 100:,} acciones de GGAL a ~${result.spot:,.2f}",
-            f"Vende {contracts} contrato(s) del call {result.symbol} a ${result.premium:,.2f}",
-            f"Deja la posicion abierta hasta el {expiry_str}",
+            step1,
+            f"Compra {n_contracts * 100:,} acciones de GGAL a ~${result.spot:,.2f} (si no las tenes ya)",
+            f"TNA objetivo: {result.tna_pct:.1f}%  |  Break-even: ${breakeven:,.0f}  "
+            f"|  Colchon: {result.cushion_pct:.1f}%",
+            f"Vencimiento {expiry_str}  ({result.days} dias) — dejar correr hasta ahí o TP al 50%",
         ]
-    capital_total = result.net_outlay * contracts * 100
+
+    capital_total = result.net_outlay * n_contracts * 100
+    # Step 1 = la orden concreta
+    step1 = (
+        f"VENDER {lote_str} put {result.symbol}  "
+        f"precio limite ${result.premium:,.2f}  "
+        f"(prima total ~${prima_total:,.0f})"
+    )
     return [
-        f"Reserva ${capital_total:,.0f} en efectivo como garantia",
-        f"Vende {contracts} contrato(s) del put {result.symbol} a ${result.premium:,.2f}",
-        (
-            f"Vencimiento {expiry_str} — si GGAL baja de ${result.strike:,.0f} "
-            f"compras la accion (eso fue planeado)"
-        ),
+        step1,
+        f"Reservar ${capital_total:,.0f} en efectivo como garantia (colchon: {result.cushion_pct:.1f}%)",
+        f"TNA objetivo: {result.tna_pct:.1f}%  |  Break-even si ejercen: ${breakeven:,.0f}",
+        f"Vencimiento {expiry_str}  ({result.days} dias) — dejar correr o recomprar al 50% de captura",
     ]
 
 
@@ -302,11 +353,22 @@ def _enrich_edges(
     from optionsdesk.core.edge import enrich_rate_result
     _sym_re = re.compile(r"^GFG([CV])(\d+(?:[.,]\d+)?)([A-Z]+)$")
 
+    # IV-rank timing: cargamos el historial de IV ATM para que el VolEdge sepa si la
+    # IV de hoy está cara o barata respecto de su propia historia.
+    iv_history: list[float] = []
+    try:
+        from optionsdesk.data.iv_history import load_iv_history
+        iv_history = load_iv_history("GGAL")
+    except Exception as e:
+        logger.debug("load_iv_history fallo: %s", e)
+
     for result in results:
         try:
-            enrich_rate_result(result, spot_history)
+            enrich_rate_result(result, spot_history, iv_history or None)
         except Exception as e:
             logger.warning("enrich_rate_result fallo para %s: %s", result.symbol, e)
+    # Nota: la PERSISTENCIA de la IV ATM diaria se hace en la capa live (dashboard),
+    # no acá, para que el recommender quede read-only y los tests no escriban a disco.
 
         # Mispricing vs sonrisa IV (v3.1)
         if smile_map and result.iv is not None:
@@ -454,16 +516,14 @@ class Recommender:
                 contracts = _size_pos(capital, rec=_SizingProxy(result))
             except Exception as e:
                 logger.warning("size_position fallo, usando fixed fractional: %s", e)
-                contracts = max(1, math.floor(capital / (result.net_outlay * 100)))
+                contracts = max(0, math.floor(capital * 0.20 / (result.net_outlay * 100)))
             # Garantía mínima: si Kelly/cap devuelve 0 pero el capital total
             # alcanza para 1 lote, mostrar 1 (indicativo, sin violar el budget).
-            if contracts == 0 and capital >= result.net_outlay * 100:
-                contracts = 1
             expected_profit = (
                 contracts * result.net_outlay * 100 * result.period_rate_pct / 100.0
             )
 
-        n = max(contracts, 1)
+        n = max(contracts, 0)
 
         try:
             plan = optimize_horizon(result, profile.value, caucion_tna=caucion_tna)
@@ -482,13 +542,44 @@ class Recommender:
                     f"El vencimiento cruza {ev.description} ({ev.event_date}) — mayor incertidumbre."
                 ]
 
+        # Enriquecer la explicación con contexto SMC (zona PDA + killzone)
+        plain = _explain(result, prob, caucion_tna)
+        smc_for_rec = getattr(context, "smc", None) if context is not None else None
+        if smc_for_rec is not None:
+            _smc_notes: list[str] = []
+            _pda_rec = getattr(smc_for_rec, "pda", None)
+            if _pda_rec is not None:
+                _zone_rec = getattr(_pda_rec, "zone", None)
+                _zone_labels = {
+                    "discount":     "Precio en zona DISCOUNT (institucional favorable para puts).",
+                    "premium":      "Precio en zona PREMIUM (institucional favorable para calls cubiertos).",
+                    "equilibrium":  "Precio en equilibrio (0.5 fib) — esperar confirmación.",
+                }
+                if _zone_rec in _zone_labels:
+                    _smc_notes.append(_zone_labels[_zone_rec])
+            _kz_rec = getattr(smc_for_rec, "killzone", None)
+            if _kz_rec == "manipulacion":
+                _smc_notes.append("Apertura BYMA (11–12h): zona de manipulación — spreads amplios, esperar desarrollo.")
+            elif _kz_rec == "distribucion":
+                _smc_notes.append("Cierre BYMA (15:30–17h): zona de distribución — posible movimiento final del día.")
+            _adr_rec = getattr(smc_for_rec, "adr_confluence", None)
+            if _adr_rec == "fx_driven":
+                _smc_notes.append("Movimiento en pesos probablemente impulsado por el dólar (CCL), no por el activo.")
+            elif _adr_rec == "confirmed":
+                _smc_notes.append("ADR en NYSE confirma el movimiento del activo subyacente.")
+            if _smc_notes:
+                plain = plain + " | " + " | ".join(_smc_notes)
+
         return Recommendation(
             result=result,
             profile=profile,
             score=round(score_val, 1),
             light=light,
             headline=_headline(result, score_val),
-            plain_explanation=_explain(result, prob, caucion_tna),
+            plain_explanation=plain,
+            intention=_intention(result),
+            win_scenario=_win_scenario(result),
+            lose_scenario=_lose_scenario(result),
             action_steps=_action_steps(result, n),
             success_probability=prob,
             expected_profit_ars=expected_profit,
@@ -537,15 +628,22 @@ def _apply_directional_boost(
     context,
     profile: RiskProfile,
 ) -> list[tuple[RateResult, float]]:
-    """Ajuste de score por tendencia y alineacion multi-timeframe.
+    """Ajuste de score por tendencia, MTF y SMC (v2.4).
 
-    La magnitud escala con mtf_alignment (v2.3):
+    MTF alignment (v2.3):
     - alineado_alcista/bajista → boost mayor (±6/5 pts)
-    - conflicto → penalizacion para la estrategia que va contra el HTF
-    - sin alineacion → comportamiento v2.2 (±4/3 pts segun tendencia diaria)
+    - conflicto → penalizacion para la estrategia contra el HTF
+    - sin alineacion → fallback v2.2 (±4/3 pts por tendencia diaria)
+
+    SMC overlay (v2.4) — ajustes adicionales no excluyentes (±3 pts max):
+    - Precio en discount + cerca de SSL → +SHORT_PUT (comprar en el suelo)
+    - Precio en premium + cerca de BSL → +COVERED_CALL (vender en el techo)
+    - Sweep de SSL con reversión alcista → +SHORT_PUT (stop-hunt alcista)
+    - Sweep de BSL con reversión bajista → +COVERED_CALL (stop-hunt bajista)
+
     Nunca elimina una recomendacion (informa, no bloquea).
     """
-    trend     = getattr(context, "trend",         None)
+    trend      = getattr(context, "trend",         None)
     confidence = getattr(context, "confidence",   "sin datos")
     alignment  = getattr(context, "mtf_alignment", "neutral")
     htf_trend  = getattr(context, "htf_trend",    trend)
@@ -557,24 +655,77 @@ def _apply_directional_boost(
     for result, s in scored:
         adj = 0.0
 
+        # ── MTF boost (v2.3) ─────────────────────────────────────────────────
         if alignment == "alineado_alcista":
             if result.strategy == "SHORT_PUT":
-                adj = 6.0   # mercado alineado alcista → vender puts es optimo
+                adj += 6.0
         elif alignment == "alineado_bajista":
             if result.strategy == "COVERED_CALL":
-                adj = 5.0   # mercado alineado bajista → CC con buen colchon
+                adj += 5.0
         elif alignment == "conflicto":
-            # Penaliza la estrategia opuesta al HTF
             if htf_trend == "bajista" and result.strategy == "SHORT_PUT":
-                adj = -4.0  # semanal baja → vender puts arriesgado
+                adj -= 4.0
             elif htf_trend == "alcista" and result.strategy == "COVERED_CALL":
-                adj = -3.0  # semanal sube → CC limita la ganancia
+                adj -= 3.0
         else:
-            # Fallback v2.2: solo tendencia diaria
             if trend == "alcista" and result.strategy == "SHORT_PUT":
-                adj = 4.0
+                adj += 4.0
             elif trend == "bajista" and result.strategy == "COVERED_CALL":
-                adj = 3.0
+                adj += 3.0
+
+        # ── SMC overlay (v2.4) ────────────────────────────────────────────────
+        smc = getattr(context, "smc", None)
+        if smc is not None:
+            smc_adj = _smc_boost(result, smc)
+            adj += max(-3.0, min(3.0, smc_adj))   # capped ±3 pts
 
         boosted.append((result, s + adj))
     return boosted
+
+
+def _smc_boost(result: "RateResult", smc: object) -> float:  # type: ignore[type-arg]
+    """Boost incremental basado en zona PDA y sweeps del SmcContext.
+
+    No importa SmcContext directamente para evitar import circular con recommender.
+    Accede a los atributos por nombre (duck typing).
+    """
+    adj = 0.0
+    pda = getattr(smc, "pda", None)
+    liquidity = getattr(smc, "liquidity", [])
+    sweeps    = getattr(smc, "sweeps", [])
+    spot      = result.spot
+
+    if pda is not None:
+        zone = getattr(pda, "zone", None)
+        if zone == "discount" and result.strategy == "SHORT_PUT":
+            adj += 2.0   # discount → comprar puts baratos tiene más margen
+        elif zone == "premium" and result.strategy == "COVERED_CALL":
+            adj += 2.0   # premium → call cubierta con colchón más amplio
+
+        # Cerca de SSL/BSL no mitigado
+        strike = result.strike
+        for lv in liquidity:
+            lv_price = getattr(lv, "price", 0.0)
+            lv_swept = getattr(lv, "swept", True)
+            lv_kind  = getattr(lv, "kind", "")
+            if lv_swept:
+                continue
+            dist_pct = abs(strike - lv_price) / max(lv_price, 1e-9)
+            if dist_pct < 0.03:   # strike dentro del 3% del nivel de liquidez
+                if lv_kind == "SSL" and result.strategy == "SHORT_PUT":
+                    adj += 1.0   # short put en zona de SSL → precio puede rebotar ahí
+                elif lv_kind == "BSL" and result.strategy == "COVERED_CALL":
+                    adj += 1.0   # covered call en zona de BSL → posible resistencia
+
+    # Sweeps recientes con reversión confirmada
+    for sw in sweeps:
+        sw_reversed  = getattr(sw, "reversed", False)
+        sw_direction = getattr(sw, "direction", "")
+        if not sw_reversed:
+            continue
+        if sw_direction == "down" and result.strategy == "SHORT_PUT":
+            adj += 1.0   # stop hunt bajista + reversión → alcista confirmado
+        elif sw_direction == "up" and result.strategy == "COVERED_CALL":
+            adj += 1.0   # stop hunt alcista + reversión → bajista confirmado
+
+    return adj

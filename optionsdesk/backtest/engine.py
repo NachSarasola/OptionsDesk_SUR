@@ -12,7 +12,6 @@ Uso:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -160,8 +159,6 @@ class BacktestEngine:
           symbol, strategy, entry_ts, exit_ts, premium_entry, premium_exit,
           pnl_swing, pnl_hold_est, swing_is_better
         """
-        from optionsdesk.core.pricing import crr_price
-        import math
 
         df_entry = self._load_range(entry_date, entry_date)
         df_exit  = self._load_range(exit_date,  exit_date)

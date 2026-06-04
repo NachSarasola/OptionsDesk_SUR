@@ -21,13 +21,22 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from optionsdesk.config.settings import settings
+from optionsdesk.data.history import append_spot_tape
 from optionsdesk.data.providers.base import MarketDataProvider, OptionsChain
 
 logger = logging.getLogger(__name__)
+
+
+def _is_byma_market_session(now: Optional[datetime] = None) -> bool:
+    """True during the regular BYMA window used by the GGAL option recorder."""
+    local_now = now or datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+    minutes = local_now.hour * 60 + local_now.minute
+    return local_now.weekday() < 5 and (11 * 60) <= minutes < (17 * 60)
 
 
 class ChainRecorder:
@@ -41,6 +50,10 @@ class ChainRecorder:
         self._provider = provider
         self._out_dir = out_dir or settings.snapshots_dir
         self._interval = settings.recorder_interval_s
+        health = provider.get_health() if hasattr(provider, "get_health") else None
+        if health is not None and health.source == "IOL":
+            self._interval = max(self._interval, settings.iol_recorder_interval_s)
+        self._spot_interval = max(settings.spot_tape_interval_s, 5)
 
     def _save_snapshot(self, chain: OptionsChain) -> None:
         ts = datetime.now(timezone.utc)
@@ -50,6 +63,23 @@ class ChainRecorder:
         out_path = self._out_dir / date_str
         out_path.mkdir(parents=True, exist_ok=True)
         health = self._provider.get_health()
+        from optionsdesk.core.carry import estimate_carry
+        from optionsdesk.core.greeks_engine import compute_chain_greeks
+
+        carry = estimate_carry(
+            chain,
+            chain.expiry_calendar,
+            fallback_tna_pct=self._provider.get_caucion_tna() or settings.default_caucion_tna,
+        )
+        try:
+            greeks = compute_chain_greeks(
+                chain,
+                chain.expiry_calendar,
+                r=carry.continuous_rate,
+            )
+        except Exception as exc:
+            logger.warning("No se pudieron persistir deltas del snapshot: %s", exc)
+            greeks = {}
 
         rows = [
             {
@@ -67,6 +97,13 @@ class ChainRecorder:
                 "ask_size": q.ask_size,
                 "source": health.source,
                 "latency_ms": health.last_latency_ms,
+                "quote_source": q.source or health.source,
+                "received_at": q.received_at,
+                "market_ts": q.market_ts,
+                "book_ts": q.book_ts,
+                "delta": getattr(greeks.get(sym), "delta", None),
+                "carry_tna_pct": carry.tna_pct,
+                "carry_source": carry.source,
             }
             for sym, q in chain.options.items()
         ]
@@ -75,20 +112,52 @@ class ChainRecorder:
 
         file_path = out_path / f"{time_str}.parquet"
         pd.DataFrame(rows).to_parquet(file_path, index=False)
+        append_spot_tape(chain.spot.mid, health.source)
         logger.debug("Snapshot guardado: %s (%d opciones)", file_path, len(rows))
+
+    def _record_spot_sample(self) -> bool:
+        """Persiste GGAL liviano entre snapshots de cadena."""
+        if not _is_byma_market_session():
+            return False
+        quote = self._provider.get_spot()
+        if quote is None or quote.mid <= 0:
+            return False
+        append_spot_tape(quote.mid, self._provider.get_health().source)
+        return True
 
     def take_snapshot(self) -> bool:
         """Toma un snapshot. Devuelve True si fue exitoso."""
+        market_open = _is_byma_market_session()
+        if not market_open:
+            self._write_status(connected=self._provider.is_connected(), lag_s=None)
+            return False
+
         # Reconexión automática si el WebSocket lleva más de 60s sin datos.
-        if hasattr(self._provider, "is_stale") and self._provider.is_stale(threshold_s=60):
+        # Primary aplica su propio cooldown para no golpear el API ante una caída.
+        if hasattr(self._provider, "ensure_realtime_connection"):
+            self._provider.ensure_realtime_connection()  # type: ignore[attr-defined]
+        elif (
+            hasattr(self._provider, "is_stale")
+            and self._provider.is_stale(threshold_s=60)
+        ):
             logger.warning("Datos stale detectados — reconectando al broker.")
-            self._provider.reconnect()  # type: ignore[attr-defined]
+            try:
+                self._provider.reconnect()  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning("Reconexión del feed falló: %s", exc)
 
         t0 = time.monotonic()
         chain = self._provider.get_options_chain()
         if chain is None:
             logger.warning("Sin datos de cadena para snapshot.")
             self._write_status(connected=False, lag_s=None)
+            return False
+        if not chain.options:
+            logger.warning("Cadena sin opciones utilizables para snapshot.")
+            self._write_status(
+                connected=self._provider.is_connected(),
+                lag_s=round(time.monotonic() - t0, 2),
+            )
             return False
 
         self._save_snapshot(chain)
@@ -106,6 +175,7 @@ class ChainRecorder:
                     "last_snapshot_ts": datetime.now(timezone.utc).isoformat(),
                     "lag_s": lag_s,
                     "connected": connected,
+                    "market_open": _is_byma_market_session(),
                 }),
                 encoding="utf-8",
             )
@@ -130,10 +200,20 @@ class ChainRecorder:
             t = threading.Thread(target=recorder.run, daemon=True)
             t.start()
         """
-        logger.info("Recorder iniciado (intervalo: %ds).", self._interval)
+        logger.info(
+            "Recorder iniciado (cadena: %ds, spot tape: %ds).",
+            self._interval,
+            self._spot_interval,
+        )
+        next_snapshot = 0.0
         while True:
-            self.take_snapshot()
-            time.sleep(self._interval)
+            now = time.monotonic()
+            if now >= next_snapshot:
+                self.take_snapshot()
+                next_snapshot = now + self._interval
+            else:
+                self._record_spot_sample()
+            time.sleep(self._spot_interval)
 
     @classmethod
     def load_day(cls, date_str: str) -> Optional[pd.DataFrame]:
@@ -149,14 +229,14 @@ class ChainRecorder:
 
 def _build_provider() -> MarketDataProvider:
     """Construye una fuente real para no grabar datos sinteticos por accidente."""
-    if settings.is_iol_configured():
+    if settings.is_primary_configured():
+        from optionsdesk.data.providers.primary import PrimaryProvider
+        provider: MarketDataProvider = PrimaryProvider()
+    elif settings.is_iol_configured():
         from optionsdesk.data.providers.iol import IOLProvider
-        provider: MarketDataProvider = IOLProvider()
-    elif settings.is_configured():
-        from optionsdesk.data.providers.homebroker import HomeBrokerProvider
-        provider = HomeBrokerProvider()
+        provider = IOLProvider()
     else:
-        raise RuntimeError("Configura credenciales IOL o HomeBroker antes de iniciar el recorder.")
+        raise RuntimeError("Configura credenciales Primary o IOL antes de iniciar el recorder.")
     provider.connect()
     return provider
 

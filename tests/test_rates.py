@@ -11,9 +11,9 @@ from optionsdesk.core.rates import compute_covered_call, compute_short_put
 ZERO = CostModel(
     stock_commission_pct=0.0, option_commission_pct=0.0,
     stock_market_fee_pct=0.0, option_market_fee_pct=0.0,
-    exercise_fee_pct=0.0, iva_rate=0.0,
+    exercise_fee_pct=0.0, exercise_market_fee_pct=0.0, iva_rate=0.0,
 )
-REAL = CostModel()  # costos reales de Bull Market
+REAL = CostModel()  # costos configurados del ALyC
 
 
 def _call(strike: float, days: int = 30) -> OptionContract:
@@ -122,6 +122,19 @@ class TestCoveredCall:
         with_cost = compute_covered_call(**kwargs, cost_model=REAL)
         assert no_cost.tna_pct > with_cost.tna_pct
 
+    def test_market_rights_include_iva(self):
+        costs = CostModel(
+            stock_commission_pct=0.0,
+            option_commission_pct=0.0,
+            stock_market_fee_pct=0.08,
+            option_market_fee_pct=0.20,
+            exercise_fee_pct=0.0,
+            exercise_market_fee_pct=0.08,
+            iva_rate=0.21,
+        )
+        assert costs.gross_cost(100_000.0, "option_buy") == pytest.approx(242.0)
+        assert costs.exercise_cost(100_000.0) == pytest.approx(96.8)
+
     def test_dividends_increase_proceeds(self):
         kwargs = dict(
             contract=_call(90.0, 30),
@@ -206,3 +219,25 @@ class TestShortPut:
         )
         result.set_spread(100.0)
         assert abs(result.spread_vs_caucion_pct - (result.tna_pct - 100.0)) < 0.001
+
+    def test_assignment_cost_worsens_short_put_breakeven(self):
+        costs = CostModel(
+            stock_commission_pct=0.0,
+            option_commission_pct=0.0,
+            stock_market_fee_pct=0.0,
+            option_market_fee_pct=0.0,
+            exercise_fee_pct=1.0,
+            exercise_market_fee_pct=0.0,
+            iva_rate=0.0,
+        )
+        result = compute_short_put(
+            _put(90.0, 30),
+            put_bid=1.5,
+            put_ask=2.5,
+            spot=100.0,
+            cost_model=costs,
+        )
+
+        assert result is not None
+        breakeven = 100.0 * (1.0 - result.cushion_pct / 100.0)
+        assert breakeven == pytest.approx(88.9)

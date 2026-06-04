@@ -44,11 +44,18 @@ class OptionGreeks:
     quote_age_s: float = 0.0
     is_tradeable: bool = True
     liquidity_reason: str = ""
+    source: str = ""
+    min_price_increment: float = 0.01
 
 
-def _quote_age_seconds(ts: datetime) -> float:
-    now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
-    return max((now - ts).total_seconds(), 0.0)
+def _quote_age_seconds(ts: datetime, now: Optional[datetime] = None) -> float:
+    if now is None:
+        current = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+    else:
+        current = now.astimezone(ts.tzinfo) if ts.tzinfo and now.tzinfo else now
+        if ts.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+    return max((current - ts).total_seconds(), 0.0)
 
 
 def _liquidity_check(
@@ -74,6 +81,7 @@ def compute_chain_greeks(
     chain: OptionsChain,
     expiry_calendar: dict,
     r: float = 0.0,
+    now: Optional[datetime] = None,
 ) -> dict[str, OptionGreeks]:
     """Calcula griegas BS para toda la cadena de opciones parseable."""
     S = chain.spot.mid
@@ -139,7 +147,7 @@ def compute_chain_greeks(
             moneyness = "OTM"
 
         spread_pct = quote.spread_pct
-        age_s = _quote_age_seconds(quote.timestamp)
+        age_s = _quote_age_seconds(quote.book_ts or quote.received_at or quote.timestamp, now=now)
         is_tradeable, reason = _liquidity_check(
             bid=quote.bid,
             ask=quote.ask,
@@ -172,6 +180,8 @@ def compute_chain_greeks(
             quote_age_s=round(age_s, 1),
             is_tradeable=is_tradeable,
             liquidity_reason=reason,
+            source=quote.source,
+            min_price_increment=float(chain.min_price_increments.get(sym, 0.01) or 0.01),
         )
 
     return result

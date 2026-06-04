@@ -163,3 +163,19 @@ def test_scenario_pnl_multiple_shocks():
 
     assert len(result.pnl_ars) == 3
     assert isinstance(result, ScenarioPnL)
+
+
+def test_gap_stress_includes_sharp_down_gap():
+    """El stress de gap debe incluir shocks severos (-20, -15) que el ±10 esconde."""
+    from optionsdesk.portfolio.aggregator import gap_stress, worst_case_loss
+    pos = _make_position(premium_received=50.0)
+    # Short put: en un gap a la baja la recompra se dispara → pérdida grande.
+    def _crr(spot, *a, **k):
+        return 50.0 if spot >= 1500.0 else 400.0   # explota bajo el strike
+    with patch("optionsdesk.portfolio.aggregator.crr_price", side_effect=_crr):
+        sc = gap_stress([pos], current_spot=1500.0)
+        shock, worst = worst_case_loss(sc)
+
+    assert -20.0 in sc.shock_pcts and -15.0 in sc.shock_pcts
+    assert worst < 0                 # el peor caso pierde plata
+    assert shock < 0                 # y es un gap a la baja

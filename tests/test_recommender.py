@@ -328,12 +328,23 @@ def test_recommender_with_capital_computes_profit(benchmark):
     cc = [_make_result(net_outlay=8200.0, period_rate_pct=1.1)]
     sp = [_make_result(strategy="SHORT_PUT", delta=-0.60, net_outlay=7800.0)]
     rec = Recommender()
-    results = rec.recommend(cc, sp, benchmark, capital=1_000_000.0)
+    results = rec.recommend(cc, sp, benchmark, capital=5_000_000.0)
     for recs_list in results.values():
         for r in recs_list:
             assert r.expected_profit_ars is not None
             assert r.expected_profit_ars > 0
             assert r.contracts >= 1
+
+
+def test_recommender_does_not_force_contract_when_cap_is_insufficient(benchmark):
+    cc = [_make_result(net_outlay=8200.0, period_rate_pct=1.1)]
+    rec = Recommender()
+    results = rec.recommend(cc, [], benchmark, capital=1_000_000.0)
+
+    for recs_list in results.values():
+        for r in recs_list:
+            assert r.expected_profit_ars == 0
+            assert r.contracts == 0
 
 
 def test_recommender_ticket_non_empty(benchmark):
