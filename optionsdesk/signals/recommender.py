@@ -11,11 +11,17 @@ una call ITM con 90% TNA y delta 0.75 le gana a una OTM con 500% y delta 0.08.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Optional
 
+from optionsdesk.config.events import spans_event
+
+logger = logging.getLogger(__name__)
+from optionsdesk.config.settings import settings
 from optionsdesk.core.benchmark import Benchmark
 from optionsdesk.core.rates import RateResult
 from optionsdesk.risk.limits import RiskChecker
@@ -29,17 +35,40 @@ class RiskProfile(str, Enum):
     AGRESIVO = "AGRESIVO"
 
 
-# Pesos de scoring y gates por perfil
+# Pesos de scoring por perfil (v2.4: EV-centric)
+# "ev" captura el edge estructural (VRP en pesos); "spread" movido a gate duro en _passes_gates.
 _WEIGHTS: dict[RiskProfile, dict[str, float]] = {
     RiskProfile.CONSERVADOR: {
-        "spread": 0.15, "cushion": 0.45, "probability": 0.30, "liquidity": 0.10
+        "ev": 0.25, "vol": 0.20, "cushion": 0.35, "probability": 0.10, "liquidity": 0.10
     },
     RiskProfile.EQUILIBRADO: {
-        "spread": 0.30, "cushion": 0.30, "probability": 0.25, "liquidity": 0.15
+        "ev": 0.40, "vol": 0.20, "cushion": 0.20, "probability": 0.10, "liquidity": 0.10
     },
     RiskProfile.AGRESIVO: {
-        "spread": 0.50, "cushion": 0.15, "probability": 0.20, "liquidity": 0.15
+        "ev": 0.55, "vol": 0.20, "cushion": 0.10, "probability": 0.10, "liquidity": 0.05
     },
+}
+
+def _get_weights(
+    profile: RiskProfile,
+    override: Optional[dict[str, float]] = None,
+) -> dict[str, float]:
+    """Devuelve los pesos de scoring del perfil, con posibilidad de override.
+
+    El `override` permite que el simulador y el GridSearch pasen pesos custom
+    sin tocar el global _WEIGHTS. Si override es None devuelve los pesos
+    estándar del perfil.
+    """
+    return dict(override) if override is not None else dict(_WEIGHTS[profile])
+
+
+# Delta objetivo de la opción escrita por perfil. Funciona como bonus de score
+# (no como gate) para no pisar _MIN_PROB. Captura el target de probabilidad
+# implícita por perfil sin forzar un rango duro.
+_DELTA_BANDS: dict[RiskProfile, tuple[float, float]] = {
+    RiskProfile.CONSERVADOR: (0.15, 0.30),
+    RiskProfile.EQUILIBRADO: (0.25, 0.40),
+    RiskProfile.AGRESIVO:    (0.35, 0.50),
 }
 
 _MIN_CUSHION: dict[RiskProfile, float] = {
@@ -80,12 +109,16 @@ class Recommendation:
 # ── Funciones puras (testeables) ──────────────────────────────────────────────
 
 def _probability(result: RateResult) -> float:
-    """P(cobrar la tasa publicada) usando delta CRR.
+    """P(cobrar la tasa publicada).
 
-    Covered call: P(S_T >= K) ≈ delta del call.
-    Short put: P(put expira OTM) = 1 − |delta del put|.
-    Fallback heurístico si delta no está disponible.
+    Prioridad: PoP física del edge (prob_profit) cuando existe — más honesta
+    porque usa la vol realizada y el breakeven real. Si no, fallback al delta CRR.
     """
+    # PoP física calculada por core/edge (usa vol realizada + breakeven real)
+    if result.prob_profit is not None:
+        return min(max(result.prob_profit, 0.0), 1.0)
+
+    # Fallback: delta CRR
     if result.delta is None:
         if result.moneyness == "ITM":
             return 0.70
@@ -109,24 +142,63 @@ def _passes_gates(result: RateResult, profile: RiskProfile) -> bool:
         return False
     if _probability(result) < _MIN_PROB[profile]:
         return False
+    # Gate blando de EV: si tenemos expectativa calculada, rechazar EV negativa
+    # en perfiles no-agresivos. AGRESIVO acepta cualquier EV (especulativo).
+    if result.expected_value_pct is not None:
+        if profile != RiskProfile.AGRESIVO and result.expected_value_pct < 0.0:
+            return False
     return True
 
 
 def _score(result: RateResult, profile: RiskProfile) -> float:
-    """Score 0–100: suma ponderada de cuatro factores normalizados."""
+    """Score 0–100: suma ponderada EV-centric (v2.4).
+
+    EV anualizado y VRP son los drivers principales. El spread vs caución
+    pasó a gate duro — ya no contamina el ranking con primas nominalmente
+    altas pero sin edge real.
+    """
     w = _WEIGHTS[profile]
-    # spread con rendimientos decrecientes: cap en 60 p.p. para que un 500% OTM
-    # no aplaste a un 90% ITM sólido
-    spread_f = min(max(result.spread_vs_caucion_pct, 0.0), 60.0) / 60.0
+
+    # EV factor: rango [-60%, +60%] ann → [0, 1]; None → neutro 0.5
+    ev_raw = result.expected_value_pct if result.expected_value_pct is not None else 0.0
+    ev_f = (min(max(ev_raw, -60.0), 60.0) / 60.0 + 1.0) / 2.0
+
+    # VRP factor: range [-15pp, +15pp] → [0, 1]; sin vol_edge → neutro 0.5
+    vrp = 0.0
+    if result.vol_edge is not None and result.vol_edge.vrp is not None:
+        vrp = result.vol_edge.vrp
+    vol_f = (min(max(vrp, -0.15), 0.15) / 0.15 + 1.0) / 2.0
+
     cushion_f = min(max(result.cushion_pct, 0.0), 15.0) / 15.0
     prob_f = _probability(result)
     liq_f = 1.0 if result.is_liquid else 0.4
+
     raw = (
-        w["spread"] * spread_f
+        w["ev"] * ev_f
+        + w["vol"] * vol_f
         + w["cushion"] * cushion_f
         + w["probability"] * prob_f
         + w["liquidity"] * liq_f
     )
+
+    # Bonus delta band: +5pts cuando el delta de la opción escrita cae en la
+    # banda objetivo del perfil (no es gate — no puede forzar la eliminación).
+    if result.delta is not None:
+        lo, hi = _DELTA_BANDS[profile]
+        if lo <= abs(result.delta) <= hi:
+            raw = min(raw + 0.05, 1.0)
+
+    # Bonus mispricing: +5pts cuando el strike cotiza >2pp caro vs la sonrisa IV.
+    # Peso pequeño (0.05) — refinamiento, no driver principal del ranking.
+    if result.mispricing_pp is not None and result.mispricing_pp > 2.0:
+        raw = min(raw + 0.05, 1.0)
+
+    # Penalización evento: -8pts cuando el vencimiento cruza un evento conocido.
+    if settings.events_enabled:
+        ev = spans_event(date.today(), result.expiration)
+        if ev is not None:
+            raw = max(raw - 0.08, 0.0)
+
     return round(raw * 100.0, 1)
 
 
@@ -213,6 +285,57 @@ def _ticket(result: RateResult, contracts: int) -> str:
     return "\n".join(lines)
 
 
+# ── Pre-pass de enriquecimiento cuantitativo ─────────────────────────────────
+
+def _enrich_edges(
+    results: list[RateResult],
+    spot_history: list[float],
+    smile_map: Optional[dict] = None,
+) -> None:
+    """Enriquece cada RateResult in-place con VolEdge, PoP, EV y mispricing (v3.1).
+
+    smile_map: dict[expiry_code → SmileFit] de core/iv_surface.build_smile_map.
+    Si falla cualquier enriquecimiento, deja el campo en None — comportamiento
+    idéntico a versiones anteriores.
+    """
+    import re
+    from optionsdesk.core.edge import enrich_rate_result
+    _sym_re = re.compile(r"^GFG([CV])(\d+(?:[.,]\d+)?)([A-Z]+)$")
+
+    for result in results:
+        try:
+            enrich_rate_result(result, spot_history)
+        except Exception as e:
+            logger.warning("enrich_rate_result fallo para %s: %s", result.symbol, e)
+
+        # Mispricing vs sonrisa IV (v3.1)
+        if smile_map and result.iv is not None:
+            try:
+                from optionsdesk.core.iv_surface import mispricing_score
+                m = _sym_re.match(result.symbol)
+                expiry = m.group(3) if m else None
+                if expiry and expiry in smile_map:
+                    strike_str = m.group(2).replace(",", ".") if m else None
+                    if strike_str:
+                        strike = float(strike_str)
+                        result.mispricing_pp = mispricing_score(strike, result.iv, smile_map[expiry])
+            except Exception as e:
+                logger.warning("mispricing_score fallo para %s: %s", result.symbol, e)
+
+
+# ── Proxy liviano para size_position ─────────────────────────────────────────
+
+class _SizingProxy:
+    """Adapta un RateResult a la interfaz que espera size_position(capital, rec).
+
+    size_position espera `rec.result` — este proxy wrappea el RateResult directamente.
+    """
+    __slots__ = ("result",)
+
+    def __init__(self, result: "RateResult") -> None:
+        self.result = result
+
+
 # ── Motor principal ───────────────────────────────────────────────────────────
 
 class Recommender:
@@ -229,11 +352,28 @@ class Recommender:
         context=None,               # MarketContext opcional
         capital: Optional[float] = None,
         spot_history: Optional[list[float]] = None,   # para VolEdge
+        chain=None,                 # OptionsChain — para smile IV (v3.1)
         top_n: int = 3,
     ) -> dict[RiskProfile, list[Recommendation]]:
         """Devuelve hasta `top_n` recomendaciones por perfil (lista vacía si no hay)."""
         all_results = list(covered_calls) + list(short_puts)
         caucion_tna = benchmark.caucion_tna_pct
+
+        # Pre-pass: enriquecer con VolEdge/PoP/EV + mispricing (v3.1).
+        # La sonrisa se fitea sobre all_results (que ya tienen IV computada),
+        # no sobre la cadena cruda (Quote no tiene IV).
+        smile_map = None
+        spot_val = all_results[0].spot if all_results else 0.0
+        if all_results and spot_val > 0:
+            try:
+                from optionsdesk.core.iv_surface import build_smile_map
+                smile_map = build_smile_map(all_results, spot_val)
+            except Exception as e:
+                logger.warning("build_smile_map fallo: %s", e)
+
+        if spot_history or smile_map:
+            _enrich_edges(all_results, spot_history or [], smile_map)
+
         return {
             profile: self._top_for_profile(
                 all_results, profile, caucion_tna, capital, context,
@@ -281,7 +421,7 @@ class Recommender:
 
         return recommendations
 
-    def _build_recommendation(
+    def _build_recommendation(  # noqa: PLR0912,PLR0915
         self,
         result: RateResult,
         score_val: float,
@@ -308,7 +448,17 @@ class Recommender:
         contracts = 0
         expected_profit: Optional[float] = None
         if capital and capital > 0 and result.net_outlay > 0:
-            contracts = max(1, math.floor(capital / (result.net_outlay * 100)))
+            # Kelly fraccional si hay EV+PoP; fallback a fixed fractional.
+            try:
+                from optionsdesk.portfolio.sizing import size_position as _size_pos
+                contracts = _size_pos(capital, rec=_SizingProxy(result))
+            except Exception as e:
+                logger.warning("size_position fallo, usando fixed fractional: %s", e)
+                contracts = max(1, math.floor(capital / (result.net_outlay * 100)))
+            # Garantía mínima: si Kelly/cap devuelve 0 pero el capital total
+            # alcanza para 1 lote, mostrar 1 (indicativo, sin violar el budget).
+            if contracts == 0 and capital >= result.net_outlay * 100:
+                contracts = 1
             expected_profit = (
                 contracts * result.net_outlay * 100 * result.period_rate_pct / 100.0
             )
@@ -317,22 +467,20 @@ class Recommender:
 
         try:
             plan = optimize_horizon(result, profile.value, caucion_tna=caucion_tna)
-        except Exception:
+        except Exception as e:
+            logger.warning("optimize_horizon fallo para %s: %s", result.symbol, e)
             plan = None
 
-        # VolEdge liviano: ±2 pts al score (ya calculado, solo para display)
-        vol_edge: Optional[VolEdge] = None
-        if spot_history:
-            try:
-                vol_edge = VolEdge.compute(result.iv, spot_history)
-                # El ajuste de score ya no afecta el orden (se aplicó antes del sort),
-                # pero actualizamos el valor mostrado al usuario.
-                if vol_edge.label == "positivo":
-                    score_val = min(score_val + 2.0, 100.0)
-                elif vol_edge.label == "negativo":
-                    score_val = max(score_val - 2.0, 0.0)
-            except Exception:
-                pass
+        # VolEdge para display: ya enriquecido en-place por _enrich_edges antes del sort.
+        vol_edge: Optional[VolEdge] = result.vol_edge  # type: ignore[assignment]
+
+        # Warning de evento: penalización ya incluida en el score, aquí solo aviso textual.
+        if settings.events_enabled:
+            ev = spans_event(date.today(), result.expiration)
+            if ev is not None:
+                warnings = list(warnings) + [
+                    f"El vencimiento cruza {ev.description} ({ev.event_date}) — mayor incertidumbre."
+                ]
 
         return Recommendation(
             result=result,

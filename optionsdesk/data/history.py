@@ -12,9 +12,10 @@ from __future__ import annotations
 import logging
 import math
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -30,6 +31,94 @@ _BYMA_SYMBOL: dict[str, str] = {
 _CACHE_STALENESS_DAYS = 4   # Refresca si el último dato tiene más de 4 días hábiles
 
 
+def tape_ohlc(samples: list[tuple[datetime, float]], rule: str = "1min") -> pd.DataFrame:
+    """Convierte observaciones reales de spot en velas sin inventar volumen."""
+    if not samples:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    raw = pd.DataFrame(samples, columns=["time", "price"])
+    raw["time"] = pd.to_datetime(raw["time"], errors="coerce")
+    raw["price"] = pd.to_numeric(raw["price"], errors="coerce")
+    raw = raw.dropna(subset=["time", "price"])
+    raw = raw[raw["price"] > 0].sort_values("time")
+    if raw.empty:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    bars = raw.set_index("time")["price"].resample(rule).ohlc().dropna().reset_index()
+    bars["volume"] = 0.0
+    return bars[["time", "open", "high", "low", "close", "volume"]]
+
+
+def daily_with_live_spot(
+    history: Optional[pd.DataFrame],
+    samples: list[tuple[datetime, float]],
+    spot: float,
+    now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Agrega o actualiza la vela diaria actual con precios realmente observados."""
+    columns = ["date", "open", "high", "low", "close", "volume"]
+    data = history.copy() if history is not None else pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in data.columns:
+            data[col] = 0.0 if col != "date" else pd.NaT
+    data = data[columns].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+
+    ba_tz = ZoneInfo("America/Argentina/Buenos_Aires")
+    current = now or datetime.now(ba_tz)
+    today = pd.Timestamp(current.date())
+    observed = []
+    for ts, price in samples:
+        if not isinstance(ts, datetime) or float(price or 0.0) <= 0:
+            continue
+        local_ts = ts.replace(tzinfo=ba_tz) if ts.tzinfo is None else ts.astimezone(ba_tz)
+        if local_ts.date() == current.date():
+            observed.append(float(price))
+    if float(spot or 0.0) > 0:
+        observed.append(float(spot))
+    if not observed:
+        return data.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    today_mask = data["date"].dt.normalize() == today
+    existing = data.loc[today_mask].tail(1)
+    open_px = observed[0]
+    high_px = max(observed)
+    low_px = min(observed)
+    volume = 0.0
+    if not existing.empty:
+        row = existing.iloc[0]
+        if float(row.get("open", 0.0) or 0.0) > 0:
+            open_px = float(row["open"])
+        high_px = max(high_px, float(row.get("high", 0.0) or 0.0))
+        old_low = float(row.get("low", 0.0) or 0.0)
+        if old_low > 0:
+            low_px = min(low_px, old_low)
+        volume = float(row.get("volume", 0.0) or 0.0)
+    data = data.loc[~today_mask]
+    live_row = pd.DataFrame([{
+        "date": today,
+        "open": open_px,
+        "high": high_px,
+        "low": low_px,
+        "close": observed[-1],
+        "volume": volume,
+    }])
+    return pd.concat([data, live_row], ignore_index=True).sort_values("date").reset_index(drop=True)
+
+
+def weekly_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    """Resample semanal incluyendo la vela diaria live cuando existe."""
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    data = daily.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data = data.dropna(subset=["date", "close"]).set_index("date")
+    return (
+        data.resample("W-FRI")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna(subset=["close"])
+        .reset_index()
+    )
+
+
 class UnderlyingHistory:
     """Historial OHLCV del subyacente, con cache local y fallback sintético."""
 
@@ -39,7 +128,12 @@ class UnderlyingHistory:
 
     # ── API pública ───────────────────────────────────────────────────────────
 
-    def daily(self, symbol: str = "GGAL", days: int = 180) -> pd.DataFrame:
+    def daily(
+        self,
+        symbol: str = "GGAL",
+        days: int = 180,
+        allow_synthetic: bool = True,
+    ) -> pd.DataFrame:
         """DataFrame OHLCV diario, últimos `days` días.
 
         Columnas: date (datetime64[ns]), open, high, low, close, volume.
@@ -53,9 +147,11 @@ class UnderlyingHistory:
         else:
             df = self._fetch_daily(symbol, days, stale_fallback=cached)
 
-        if df is None or df.empty:
+        if (df is None or df.empty) and allow_synthetic:
             logger.warning("history.daily: usando serie sintética para %s.", symbol)
             df = self._synthetic_daily(days)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
         # Normaliza y devuelve los últimos `days` registros
         df = df.copy()
@@ -63,9 +159,14 @@ class UnderlyingHistory:
         df = df.sort_values("date").tail(days).reset_index(drop=True)
         return df
 
-    def weekly(self, symbol: str = "GGAL", weeks: int = 104) -> pd.DataFrame:
+    def weekly(
+        self,
+        symbol: str = "GGAL",
+        weeks: int = 104,
+        allow_synthetic: bool = True,
+    ) -> pd.DataFrame:
         """OHLCV semanal (resampleado desde daily). Ultimas `weeks` semanas."""
-        df_daily = self.daily(symbol, days=weeks * 7 + 30)
+        df_daily = self.daily(symbol, days=weeks * 7 + 30, allow_synthetic=allow_synthetic)
         if df_daily.empty:
             return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
         return self._resample(df_daily, "W-FRI").tail(weeks).reset_index(drop=True)
@@ -187,7 +288,8 @@ class UnderlyingHistory:
             return None
         try:
             return pd.read_parquet(path)
-        except Exception:
+        except Exception as e:
+            logger.debug("read_parquet fallo para %s: %s", path, e)
             return None
 
     @staticmethod

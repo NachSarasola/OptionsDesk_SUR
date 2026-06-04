@@ -20,6 +20,8 @@ dependencies = [
     "pyobd>=0.3",
     "pandas-ta>=0.3.14b",
     "smartmoneyconcepts>=0.0.27",
+    "streamlit-autorefresh>=0.0.1",
+    "duckdb>=0.10",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +29,9 @@ dev = ["pytest>=7.4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: tests que usan servicios externos",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

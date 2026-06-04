@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -34,7 +34,8 @@ class Quote:
         return (self.ask - self.bid) / m * 100.0
 
     def is_stale(self, max_age_s: float = 300.0) -> bool:
-        dt = (datetime.now() - self.timestamp).total_seconds()
+        now = datetime.now(self.timestamp.tzinfo) if self.timestamp.tzinfo else datetime.now()
+        dt = (now - self.timestamp).total_seconds()
         return dt > max_age_s
 
 
@@ -44,33 +45,47 @@ class OptionsChain:
 
     underlying: str
     spot: Quote
-    options: dict[str, Quote]      # symbol → Quote
+    options: dict[str, Quote]
     timestamp: datetime = field(default_factory=datetime.now)
+    expiry_calendar: dict[str, date] = field(default_factory=dict)
+
+
+@dataclass
+class MarketDataHealth:
+    """Estado operativo del feed de mercado para diagnostico y UI."""
+
+    source: str
+    connected: bool
+    last_success_ts: Optional[datetime] = None
+    last_error: str = ""
+    last_latency_ms: Optional[float] = None
+    requests: int = 0
+    timeouts: int = 0
+    retries: int = 0
+    options_seen: int = 0
+    options_tradeable: int = 0
 
 
 class MarketDataProvider(ABC):
-    """Interfaz para todas las fuentes de datos de mercado.
-
-    Implementaciones:
-      - HomeBrokerProvider: datos en tiempo real vía pyhomebroker (Bull Market)
-      - BymaOpenProvider:   datos demorados de BYMA Open Data (fallback)
-      - DemoProvider:       datos sintéticos para desarrollo y tests
-    """
+    """Interfaz para todas las fuentes de datos de mercado."""
 
     @abstractmethod
     def get_options_chain(self) -> Optional[OptionsChain]:
-        """Cadena de opciones GGAL más reciente. None si no hay datos."""
+        """Cadena de opciones GGAL mas reciente. None si no hay datos."""
         ...
 
     @abstractmethod
     def get_spot(self) -> Optional[Quote]:
-        """Quote de la acción GGAL."""
+        """Quote de la accion GGAL."""
         ...
 
     @abstractmethod
     def get_caucion_tna(self, days: int = 30) -> Optional[float]:
-        """TNA (%) de la caución colocadora para el plazo dado."""
+        """TNA (%) de la caucion colocadora para el plazo dado."""
         ...
 
     def is_connected(self) -> bool:
         return False
+
+    def get_health(self) -> MarketDataHealth:
+        return MarketDataHealth(source=self.__class__.__name__, connected=self.is_connected())

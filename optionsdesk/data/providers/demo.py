@@ -5,10 +5,13 @@ leve ruido aleatorio para simular un feed en vivo. Funciona sin credenciales.
 """
 from __future__ import annotations
 
+import logging
 import math
 import random
 from datetime import date, datetime, timedelta
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from optionsdesk.core.pricing import bs_price
 from optionsdesk.data.providers.base import MarketDataProvider, OptionsChain, Quote
@@ -31,8 +34,8 @@ def _future_expiry_codes(n: int = 3) -> list[tuple[str, date]]:
             key=lambda x: x[1],
         )
         return future[:n]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("load_expiry_calendar fallo en DemoProvider: %s", e)
     # Fallback: generar vencimientos sintéticos si no hay calendario
     today = date.today()
     return [
@@ -105,6 +108,7 @@ class DemoProvider(MarketDataProvider):
             underlying="GGAL",
             spot=spot_quote,
             options=options,
+            expiry_calendar=dict(future_expiries),
         )
 
     def is_connected(self) -> bool:

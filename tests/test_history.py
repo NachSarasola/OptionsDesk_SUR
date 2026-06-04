@@ -128,6 +128,15 @@ def test_daily_fallback_when_pyobd_unavailable():
         assert len(df) <= 30
 
 
+def test_daily_can_disable_synthetic_fallback_for_live_mode():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = UnderlyingHistory(cache_dir=Path(tmp))
+        with patch.dict("sys.modules", {"pyobd": None}):
+            df = h.daily("GGAL", days=30, allow_synthetic=False)
+        assert df.empty
+        assert list(df.columns) == ["date", "open", "high", "low", "close", "volume"]
+
+
 def test_daily_uses_cache_when_fresh():
     """Si hay caché fresco, lo usa sin llamar a PyOBD."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -224,8 +233,12 @@ def test_weekly_limits_to_requested_weeks():
 
 
 def test_resample_static():
-    """_resample sobre un DataFrame de 14 dias debe dar <=2 velas semanales."""
+    """_resample sobre un DataFrame de 14 dias debe dar <=3 velas semanales.
+
+    El máximo es 3: si el rango arranca en sábado, el W-FRI abre un bin extra
+    al final. El caso más común es 2, pero 3 es correcto y esperado.
+    """
     df = _make_fresh_df(14)
     out = UnderlyingHistory._resample(df, "W-FRI")
-    assert len(out) <= 2
+    assert 1 <= len(out) <= 3
     assert "close" in out.columns

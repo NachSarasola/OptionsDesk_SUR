@@ -3,7 +3,12 @@ from datetime import date
 
 import pytest
 
-from optionsdesk.core.instruments import OptionContract, OptionType, parse_option_symbol
+from optionsdesk.core.instruments import (
+    OptionContract,
+    OptionType,
+    merge_expiry_calendars,
+    parse_option_symbol,
+)
 
 CALENDAR = {
     "E": date(2026, 5, 15),
@@ -91,3 +96,16 @@ class TestMoneyness:
         c = OptionContract("SYM", "GGAL", OptionType.CALL, 101.0,
                            date(2026, 6, 19), "F")
         assert c.moneyness(100.0, atm_threshold_pct=2.0) == "ATM"
+
+
+def test_merge_expiry_calendars_prefers_observed_feed_date():
+    merged = merge_expiry_calendars(
+        {"J": date(2026, 6, 12), "AG": date(2026, 8, 21)},
+        {"J": date(2026, 6, 19), "JU": date(2026, 6, 19)},
+    )
+
+    assert merged == {
+        "J": date(2026, 6, 19),
+        "AG": date(2026, 8, 21),
+        "JU": date(2026, 6, 19),
+    }

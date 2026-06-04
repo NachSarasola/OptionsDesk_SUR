@@ -29,6 +29,9 @@ def bs_price(
     """
     if T <= 0:
         return max(S - K, 0.0) if option_type == "C" else max(K - S, 0.0)
+    if sigma <= 0:
+        # sigma=0: sin incertidumbre → opcion vale solo el intrinseco
+        return max(S - K, 0.0) if option_type == "C" else max(K - S, 0.0)
     sqrtT = math.sqrt(T)
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT
@@ -45,6 +48,10 @@ def bs_delta(
         if option_type == "C":
             return 1.0 if S > K else 0.0
         return -1.0 if S < K else 0.0
+    if sigma <= 0:
+        if option_type == "C":
+            return 1.0 if S > K else 0.0
+        return -1.0 if S < K else 0.0
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     if option_type == "C":
         return math.exp(-q * T) * norm.cdf(d1)
@@ -54,7 +61,7 @@ def bs_delta(
 def bs_gamma(
     S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0,
 ) -> float:
-    if T <= 0 or S <= 0:
+    if T <= 0 or S <= 0 or sigma <= 0:
         return 0.0
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     return math.exp(-q * T) * norm.pdf(d1) / (S * sigma * math.sqrt(T))
@@ -65,7 +72,7 @@ def bs_theta(
     option_type: str, q: float = 0.0,
 ) -> float:
     """Theta por día calendario."""
-    if T <= 0:
+    if T <= 0 or sigma <= 0:
         return 0.0
     sqrtT = math.sqrt(T)
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrtT)
@@ -88,7 +95,7 @@ def bs_vega(
     S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0,
 ) -> float:
     """Vega por 1% de movimiento en vol."""
-    if T <= 0:
+    if T <= 0 or sigma <= 0:
         return 0.0
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     return S * math.exp(-q * T) * norm.pdf(d1) * math.sqrt(T) / 100.0
@@ -99,7 +106,7 @@ def bs_rho(
     option_type: str, q: float = 0.0,
 ) -> float:
     """Rho por 1% de movimiento en la tasa."""
-    if T <= 0:
+    if T <= 0 or sigma <= 0:
         return 0.0
     d2 = (
         (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
@@ -134,6 +141,8 @@ def crr_price(
                S_adj_nodo + VP(dividendos restantes).
     """
     if T <= 0:
+        return max(S - K, 0.0) if option_type == "C" else max(K - S, 0.0)
+    if sigma <= 0:
         return max(S - K, 0.0) if option_type == "C" else max(K - S, 0.0)
 
     dividends = [(t, d) for t, d in (dividends or []) if 0.0 < t <= T]
@@ -188,6 +197,8 @@ def crr_delta(
     S: float, K: float, T: float, r: float, sigma: float,
     option_type: str, **kwargs,
 ) -> float:
+    if S <= 0:
+        return 0.0
     h = S * 0.01
     return (
         crr_price(S + h, K, T, r, sigma, option_type, **kwargs)
@@ -199,6 +210,8 @@ def crr_gamma(
     S: float, K: float, T: float, r: float, sigma: float,
     option_type: str, **kwargs,
 ) -> float:
+    if S <= 0:
+        return 0.0
     h = S * 0.01
     up = crr_price(S + h, K, T, r, sigma, option_type, **kwargs)
     mid = crr_price(S, K, T, r, sigma, option_type, **kwargs)
@@ -266,6 +279,43 @@ def implied_vol(
         return float(brentq(f, sigma_lo, sigma_hi, xtol=1e-6, maxiter=50))
     except (ValueError, RuntimeError):
         return None
+
+
+# ── Probabilidad de tocar una barrera (reflection principle) ─────────────────
+
+def prob_touch(
+    spot: float,
+    barrier: float,
+    T: float,
+    sigma: float,
+) -> float:
+    """P(S_t toca barrier en [0,T]) bajo GBM con drift=0 (medida física).
+
+    Reflection principle aplicado a X_t = log(S_t/S_0) con drift = -σ²/2.
+    Válido para barreras arriba o abajo del spot.
+
+    Uso típico: estimar riesgo de asignación temprana del short leg en credit
+    spreads americanos. P(touch) ≥ P(S_T cierra del lado equivocado) siempre;
+    cerca del strike puede ser ~2× mayor que la PoP terminal.
+
+    Fórmulas (derivadas por cambio de medida / Girsanov):
+      Up barrier   (B > S): N(-d_-) + (S/B)·N(-d_+)
+      Down barrier (B < S): N( d_+) + (S/B)·N( d_-)
+    donde d_± = (log(B/S) ± σ²T/2) / (σ√T).
+    """
+    if T <= 0 or sigma <= 0 or spot <= 0 or barrier <= 0:
+        return 0.0
+    if barrier == spot:
+        return 1.0
+    sig_t  = sigma * math.sqrt(T)
+    log_bs = math.log(barrier / spot)
+    sig2T  = sigma ** 2 * T / 2
+    d_plus  = (log_bs + sig2T) / sig_t
+    d_minus = (log_bs - sig2T) / sig_t
+    ratio   = spot / barrier
+    if barrier > spot:
+        return float(norm.cdf(-d_minus) + ratio * norm.cdf(-d_plus))
+    return float(norm.cdf(d_plus) + ratio * norm.cdf(d_minus))
 
 
 # ── Probabilidad risk-neutral ─────────────────────────────────────────────────

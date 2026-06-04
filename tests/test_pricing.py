@@ -180,3 +180,83 @@ class TestImpliedVol:
         iv = implied_vol(price, S, K, T, r, "C", american=False, steps=100)
         assert iv is not None
         assert abs(iv - sigma_true) < 0.005
+
+
+# ── prob_touch ────────────────────────────────────────────────────────────────
+
+from optionsdesk.core.pricing import prob_touch
+
+
+def test_prob_touch_at_barrier_is_one():
+    """spot = barrier → ya tocado → P = 1."""
+    assert prob_touch(spot=100.0, barrier=100.0, T=0.1, sigma=0.60) == pytest.approx(1.0)
+
+
+def test_prob_touch_above_terminal_prob_up():
+    """P(touch B) >= P(S_T > B) para barreras arriba del spot."""
+    import math
+    from scipy.stats import norm
+    spot, barrier, T, sigma = 100.0, 110.0, 30/365, 0.60
+    # P terminal: risk_neutral_prob_above
+    from optionsdesk.core.pricing import risk_neutral_prob_above
+    p_terminal = risk_neutral_prob_above(spot, barrier, T, 0.0, sigma)
+    p_touch = prob_touch(spot, barrier, T, sigma)
+    assert p_touch >= p_terminal
+
+
+def test_prob_touch_up_increases_with_sigma():
+    """Mayor sigma → mayor P(touch) para barrera arriba."""
+    spot, barrier, T = 100.0, 115.0, 30 / 365
+    p_low  = prob_touch(spot, barrier, T, sigma=0.30)
+    p_high = prob_touch(spot, barrier, T, sigma=0.90)
+    assert p_high > p_low
+
+
+def test_prob_touch_down_barrier():
+    """Barrera por debajo del spot devuelve valor coherente en (0,1)."""
+    p = prob_touch(spot=100.0, barrier=90.0, T=30 / 365, sigma=0.60)
+    assert 0.0 < p < 1.0
+
+
+def test_prob_touch_zero_T_returns_zero():
+    """T=0 sin toque activo → 0."""
+    assert prob_touch(spot=100.0, barrier=110.0, T=0.0, sigma=0.60) == pytest.approx(0.0)
+
+
+def test_prob_touch_increases_with_T():
+    """Mismo spot/barrier/sigma, T mayor → P(touch) mayor."""
+    spot, barrier, sigma = 100.0, 115.0, 0.60
+    p_short = prob_touch(spot, barrier, T=10 / 365, sigma=sigma)
+    p_medium = prob_touch(spot, barrier, T=30 / 365, sigma=sigma)
+    p_long = prob_touch(spot, barrier, T=90 / 365, sigma=sigma)
+    assert p_short < p_medium < p_long
+
+
+# ── sigma=0 guards ────────────────────────────────────────────────────────────
+
+def test_bs_sigma_zero_call_returns_intrinsic():
+    assert bs_price(110.0, 100.0, 0.25, 0.05, 0.0, "C") == pytest.approx(10.0)
+
+
+def test_bs_sigma_zero_put_returns_intrinsic():
+    assert bs_price(90.0, 100.0, 0.25, 0.05, 0.0, "P") == pytest.approx(10.0)
+
+
+def test_bs_sigma_zero_otm_call_returns_zero():
+    assert bs_price(90.0, 100.0, 0.25, 0.05, 0.0, "C") == pytest.approx(0.0)
+
+
+def test_bs_greeks_sigma_zero_no_crash():
+    """Ninguna griega BS debe tirar ZeroDivisionError con sigma=0."""
+    assert bs_delta(S, K, T, r, 0.0, "C") == pytest.approx(0.0)
+    assert bs_gamma(S, K, T, r, 0.0) == pytest.approx(0.0)
+    assert bs_theta(S, K, T, r, 0.0, "C") == pytest.approx(0.0)
+    assert bs_vega(S, K, T, r, 0.0) == pytest.approx(0.0)
+    assert bs_rho(S, K, T, r, 0.0, "C") == pytest.approx(0.0)
+
+
+def test_crr_sigma_zero_returns_intrinsic():
+    """CRR con sigma=0 no debe crashear — devuelve intrínseco."""
+    assert crr_price(110.0, 100.0, 0.25, 0.05, 0.0, "C") == pytest.approx(10.0)
+    assert crr_price(90.0, 100.0, 0.25, 0.05, 0.0, "P") == pytest.approx(10.0)
+    assert crr_price(90.0, 100.0, 0.25, 0.05, 0.0, "C") == pytest.approx(0.0)

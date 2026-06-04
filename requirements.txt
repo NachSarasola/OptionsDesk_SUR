@@ -8,5 +8,5 @@ python-dotenv>=1.0
 requests>=2.31
 pyyaml>=6.0
 pyobd>=0.3
-pandas-ta>=0.3.14b
+# pandas-ta>=0.3.14b  # Requiere Python 3.12+, es opcional en technical.py
 smartmoneyconcepts>=0.0.27

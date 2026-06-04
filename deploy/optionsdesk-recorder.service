@@ -1,0 +1,21 @@
+[Unit]
+Description=OptionsDesk — Chain recorder (WebSocket Bull Market)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=optionsdesk
+WorkingDirectory=/opt/optionsdesk
+EnvironmentFile=/opt/optionsdesk/.env
+ExecStart=/opt/optionsdesk/.venv/bin/python -m optionsdesk.data.recorder
+Restart=always
+RestartSec=15
+# Dejar tiempo para que el WS se reconecte antes de reiniciar
+StartLimitBurst=5
+StartLimitIntervalSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

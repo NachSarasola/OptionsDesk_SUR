@@ -29,7 +29,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POSITIONS_FILE = Path("data/open_positions.jsonl")
 _CRR_STEPS = 50
+
+
+def _optional_float(value) -> Optional[float]:
+    return float(value) if value not in (None, "") else None
 
 
 @dataclass
@@ -55,6 +59,25 @@ class OpenPosition:
     target_exit_days: int
     target_capture_pct: float
     caucion_tna: float = 60.0
+    # Parámetros de gestión activa (v2.4) — retrocompatibles via .get() con defaults
+    max_loss_mult: float = 2.0   # stop a max_loss_mult × prima cobrada
+    roll_dte: int = 21           # señal de roll cuando quedan ≤ roll_dte días
+    defend_delta: float = 0.50   # señal de defensa cuando |delta| ≥ defend_delta
+    # Cantidad de contratos abiertos (v3.1) — default 1 para retrocompatibilidad
+    contracts: int = 1
+    # Plan intradia opcional. Se conserva separado de la gestion swing por CRR.
+    opened_at: Optional[datetime] = None
+    scalp_plan_entry: Optional[float] = None
+    scalp_plan_sl: Optional[float] = None
+    scalp_plan_tp: Optional[float] = None
+    scalp_plan_rr: Optional[float] = None
+    scalp_pop: Optional[float] = None
+    scalp_expected_value_ars: Optional[float] = None
+    scalp_edge_r: Optional[float] = None
+    scalp_fill_probability: Optional[float] = None
+    scalp_cost_to_target_pct: Optional[float] = None
+    scalp_time_stop_min: Optional[int] = None
+    scalp_allow_overnight: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "OpenPosition":
@@ -71,6 +94,22 @@ class OpenPosition:
             target_exit_days=int(d["target_exit_days"]),
             target_capture_pct=float(d["target_capture_pct"]),
             caucion_tna=float(d.get("caucion_tna", 60.0)),
+            max_loss_mult=float(d.get("max_loss_mult", 2.0)),
+            roll_dte=int(d.get("roll_dte", 21)),
+            defend_delta=float(d.get("defend_delta", 0.50)),
+            contracts=int(d.get("contracts", 1)),
+            opened_at=datetime.fromisoformat(d["opened_at"]) if d.get("opened_at") else None,
+            scalp_plan_entry=_optional_float(d.get("scalp_plan_entry")),
+            scalp_plan_sl=_optional_float(d.get("scalp_plan_sl")),
+            scalp_plan_tp=_optional_float(d.get("scalp_plan_tp")),
+            scalp_plan_rr=_optional_float(d.get("scalp_plan_rr")),
+            scalp_pop=_optional_float(d.get("scalp_pop")),
+            scalp_expected_value_ars=_optional_float(d.get("scalp_expected_value_ars")),
+            scalp_edge_r=_optional_float(d.get("scalp_edge_r")),
+            scalp_fill_probability=_optional_float(d.get("scalp_fill_probability")),
+            scalp_cost_to_target_pct=_optional_float(d.get("scalp_cost_to_target_pct")),
+            scalp_time_stop_min=int(d["scalp_time_stop_min"]) if d.get("scalp_time_stop_min") is not None else None,
+            scalp_allow_overnight=bool(d.get("scalp_allow_overnight", False)),
         )
 
     @property
@@ -83,7 +122,7 @@ class OpenPosition:
 
     @property
     def opt_type(self) -> str:
-        return "C" if self.strategy == "COVERED_CALL" else "P"
+        return "C" if "CALL" in self.strategy else "P"
 
 
 class PositionMonitor:
@@ -119,6 +158,34 @@ class PositionMonitor:
                     logger.warning("Línea inválida en posiciones: %.60s — %s", line, exc)
         return positions
 
+    def remove_position_at(self, index: int) -> bool:
+        """Elimina una posicion local por indice sin descartar lineas desconocidas."""
+        if index < 0 or not self._file.exists():
+            return False
+
+        retained: list[str] = []
+        valid_index = -1
+        removed = False
+        for raw_line in self._file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                OpenPosition.from_dict(json.loads(line))
+                valid_index += 1
+            except (KeyError, ValueError):
+                retained.append(raw_line)
+                continue
+            if valid_index == index:
+                removed = True
+                continue
+            retained.append(raw_line)
+
+        if removed:
+            payload = "\n".join(retained)
+            self._file.write_text(payload + ("\n" if payload else ""), encoding="utf-8")
+        return removed
+
     def compute_capture(
         self,
         pos: OpenPosition,
@@ -143,43 +210,49 @@ class PositionMonitor:
                 S, pos.strike, T_rem, r, pos.iv_entry, pos.opt_type, steps=_CRR_STEPS
             )
 
-        # P&L actual: lo que recibimos menos lo que cuesta recomprar
-        pnl_now = pos.premium_received - current_ov
-        # P&L al hold completo ≈ prima completa (opción expira OTM)
-        pnl_full = pos.premium_received
-
-        if pnl_full <= 0:
-            return 0.0
-        return max(pnl_now / pnl_full * 100.0, 0.0)
+        is_long = "LONG" in pos.strategy
+        if is_long:
+            pnl_now = current_ov - pos.net_outlay
+            return (pnl_now / pos.net_outlay * 100.0) if pos.net_outlay > 0 else 0.0
+        else:
+            pnl_now = pos.premium_received - current_ov
+            pnl_full = pos.premium_received
+            if pnl_full <= 0:
+                return 0.0
+            return max(pnl_now / pnl_full * 100.0, 0.0)
 
     def check_and_alert(
         self,
         positions: Optional[list[OpenPosition]] = None,
         current_spot: Optional[float] = None,
+        current_iv: Optional[float] = None,
     ) -> list[OpenPosition]:
-        """Evalúa cada posición y alerta las que alcanzaron su objetivo.
+        """Evalúa cada posición y alerta según la señal de gestión activa.
 
-        Devuelve la lista de posiciones alertadas.
+        Devuelve la lista de posiciones con señal accionable (no HOLD).
         """
+        from optionsdesk.signals.management import evaluate_position, SignalType
+
         if positions is None:
             positions = self.load_positions()
         triggered: list[OpenPosition] = []
         alerter = self._get_alerter()
+
         for pos in positions:
-            capture = self.compute_capture(pos, current_spot)
+            spot = current_spot or pos.spot_entry
+            signal = evaluate_position(pos, spot, current_iv)
+
             logger.debug(
-                "%s  captura=%.1f%%  objetivo=%.1f%%",
-                pos.symbol, capture, pos.target_capture_pct,
+                "%s  captura=%.1f%%  señal=%s",
+                pos.symbol, signal.capture_pct, signal.signal_type,
             )
-            if capture >= pos.target_capture_pct:
-                alerter.send_swing_target(
-                    symbol=pos.symbol,
-                    capture_pct=capture,
-                    target_pct=pos.target_capture_pct,
-                    strategy=pos.strategy,
-                    days_held=pos.days_held,
-                )
-                triggered.append(pos)
+
+            if signal.signal_type == SignalType.HOLD:
+                continue
+
+            alerter.send_management_signal(signal, pos)
+            triggered.append(pos)
+
         return triggered
 
     def run_once(self, current_spot: Optional[float] = None) -> None:

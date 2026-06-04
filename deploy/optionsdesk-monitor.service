@@ -1,0 +1,12 @@
+[Unit]
+Description=OptionsDesk — Monitor de posiciones abiertas (disparo único)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=optionsdesk
+WorkingDirectory=/opt/optionsdesk
+EnvironmentFile=/opt/optionsdesk/.env
+ExecStart=/opt/optionsdesk/.venv/bin/python -m optionsdesk.signals.monitor
+StandardOutput=journal
+StandardError=journal

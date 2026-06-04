@@ -9,10 +9,13 @@ Formato de almacenamiento:
     data/snapshots/YYYY-MM-DD/HH-MM-SS.parquet
 
 Cada archivo contiene todas las opciones de la cadena en ese momento,
-con columnas: timestamp, symbol, spot, bid, ask, last, volume.
+con columnas base: timestamp, symbol, spot, bid, ask, last, volume.
+Las columnas nuevas son aditivas y opcionales para backtests mas realistas:
+bid_size, ask_size, spot_bid, spot_ask, spot_last, source, latency_ms.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -46,16 +49,24 @@ class ChainRecorder:
 
         out_path = self._out_dir / date_str
         out_path.mkdir(parents=True, exist_ok=True)
+        health = self._provider.get_health()
 
         rows = [
             {
                 "timestamp": ts,
                 "symbol": sym,
                 "spot": chain.spot.mid,
+                "spot_bid": chain.spot.bid,
+                "spot_ask": chain.spot.ask,
+                "spot_last": chain.spot.last,
                 "bid": q.bid,
                 "ask": q.ask,
                 "last": q.last,
                 "volume": q.volume,
+                "bid_size": q.bid_size,
+                "ask_size": q.ask_size,
+                "source": health.source,
+                "latency_ms": health.last_latency_ms,
             }
             for sym, q in chain.options.items()
         ]
@@ -68,13 +79,38 @@ class ChainRecorder:
 
     def take_snapshot(self) -> bool:
         """Toma un snapshot. Devuelve True si fue exitoso."""
+        # Reconexión automática si el WebSocket lleva más de 60s sin datos.
+        if hasattr(self._provider, "is_stale") and self._provider.is_stale(threshold_s=60):
+            logger.warning("Datos stale detectados — reconectando al broker.")
+            self._provider.reconnect()  # type: ignore[attr-defined]
+
+        t0 = time.monotonic()
         chain = self._provider.get_options_chain()
         if chain is None:
             logger.warning("Sin datos de cadena para snapshot.")
+            self._write_status(connected=False, lag_s=None)
             return False
+
         self._save_snapshot(chain)
         self._run_monitor_hook(chain.spot.mid if chain.spot else None)
+        self._write_status(connected=True, lag_s=round(time.monotonic() - t0, 2))
         return True
+
+    def _write_status(self, connected: bool, lag_s: Optional[float]) -> None:
+        """Escribe data/recorder_status.json para que el dashboard muestre el estado."""
+        status_path = Path("data/recorder_status.json")
+        try:
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps({
+                    "last_snapshot_ts": datetime.now(timezone.utc).isoformat(),
+                    "lag_s": lag_s,
+                    "connected": connected,
+                }),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.debug("No se pudo escribir recorder_status.json: %s", exc)
 
     def _run_monitor_hook(self, current_spot: Optional[float]) -> None:
         """Invoca el monitor de posiciones abiertas si está habilitado."""
@@ -109,3 +145,32 @@ class ChainRecorder:
         if not files:
             return None
         return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def _build_provider() -> MarketDataProvider:
+    """Construye una fuente real para no grabar datos sinteticos por accidente."""
+    if settings.is_iol_configured():
+        from optionsdesk.data.providers.iol import IOLProvider
+        provider: MarketDataProvider = IOLProvider()
+    elif settings.is_configured():
+        from optionsdesk.data.providers.homebroker import HomeBrokerProvider
+        provider = HomeBrokerProvider()
+    else:
+        raise RuntimeError("Configura credenciales IOL o HomeBroker antes de iniciar el recorder.")
+    provider.connect()
+    return provider
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    provider = _build_provider()
+    try:
+        ChainRecorder(provider).run()
+    except KeyboardInterrupt:
+        logger.info("Recorder detenido.")
+    finally:
+        provider.disconnect()
+
+
+if __name__ == "__main__":
+    main()

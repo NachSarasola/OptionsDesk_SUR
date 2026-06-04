@@ -13,10 +13,14 @@ from optionsdesk.core.spreads import (
     build_bear_call_spread,
     build_bull_put_spread,
     build_bear_put_spread,
+    spread_payoff,
+    spread_expected_value,
     _net_debit_per_share,
 )
 
-TODAY   = date.today()
+import numpy as np
+
+TODAY   = date(2026, 6, 20)   # fijo — inmune a vencimientos reales
 EXPIRY  = TODAY + timedelta(days=30)
 DAYS    = 30
 SPOT    = 8300.0
@@ -252,3 +256,176 @@ def test_costs_increase_net_debit():
 def test_net_debit_helper():
     nd = _net_debit_per_share(300.0, 150.0, ZERO_COSTS)
     assert abs(nd - 150.0) < 1e-9
+
+
+# ── spread_payoff ─────────────────────────────────────────────────────────────
+
+def test_spread_payoff_bull_call_knots():
+    """Verifica los quiebres del payoff lineal a tramos."""
+    K_lo, K_hi = 8000.0, 8500.0
+    mp, ml = 35_000.0, 15_000.0   # ancho=500, net_dbt=150 → max_profit=35k, max_loss=15k
+
+    # Por debajo de K_lo: max_loss negativo
+    pnl_below = spread_payoff("BULL_CALL", K_lo, K_hi, mp, ml, [7000.0])
+    assert abs(pnl_below[0] - (-ml)) < 1.0
+
+    # Por encima de K_hi: max_profit
+    pnl_above = spread_payoff("BULL_CALL", K_lo, K_hi, mp, ml, [9000.0])
+    assert abs(pnl_above[0] - mp) < 1.0
+
+    # En K_lo: -max_loss
+    assert abs(spread_payoff("BULL_CALL", K_lo, K_hi, mp, ml, [K_lo])[0] - (-ml)) < 1.0
+
+    # En K_hi: +max_profit
+    assert abs(spread_payoff("BULL_CALL", K_lo, K_hi, mp, ml, [K_hi])[0] - mp) < 1.0
+
+
+def test_spread_payoff_bear_call_direction():
+    """Bear call: max_profit en K_lo, -max_loss en K_hi (pendiente inversa)."""
+    K_lo, K_hi = 8000.0, 8500.0
+    mp, ml = 15_000.0, 35_000.0
+    assert abs(spread_payoff("BEAR_CALL", K_lo, K_hi, mp, ml, [7000.0])[0] - mp) < 1.0
+    assert abs(spread_payoff("BEAR_CALL", K_lo, K_hi, mp, ml, [9000.0])[0] - (-ml)) < 1.0
+
+
+def test_spread_payoff_bounded():
+    """El payoff siempre esta acotado en [-max_loss, max_profit]."""
+    spots = np.linspace(1000.0, 20000.0, 500)
+    for strategy in ("BULL_CALL", "BEAR_CALL", "BULL_PUT", "BEAR_PUT"):
+        pnl = spread_payoff(strategy, 8000.0, 8500.0, 35_000.0, 15_000.0, spots)
+        assert np.all(pnl >= -15_000.0 - 1e-6)
+        assert np.all(pnl <= 35_000.0 + 1e-6)
+
+
+# ── spread_expected_value ─────────────────────────────────────────────────────
+
+def test_ev_bounded_within_payoff_range():
+    """EV debe estar en [-max_loss, max_profit]."""
+    ev = spread_expected_value("BULL_CALL", 8000.0, 8500.0, 35_000.0, 15_000.0,
+                               spot=8300.0, days=30, sigma=0.65)
+    assert -15_000.0 <= ev <= 35_000.0
+
+
+def test_ev_increases_with_positive_drift():
+    """Para BULL_CALL, EV crece al subir el drift (más probabilidad de terminar ITM)."""
+    common = dict(
+        strategy="BULL_CALL", k_lo=8000.0, k_hi=8500.0,
+        max_profit=35_000.0, max_loss=15_000.0,
+        spot=8300.0, days=30, sigma=0.65,
+    )
+    ev_zero   = spread_expected_value(**common, drift=0.0)
+    ev_posit  = spread_expected_value(**common, drift=0.5)
+    assert ev_posit > ev_zero
+
+
+def test_ev_executable_gt_mid_for_debit():
+    """Con precios ejecutables (buy@ask, sell@bid) el debito sube → EV cae vs mid."""
+    args = (
+        "A", 8000.0, 290.0, 310.0,   # long: symbol, strike, bid, ask
+        "B", 8500.0, 140.0, 160.0,   # short: symbol, strike, bid, ask
+        EXPIRY, DAYS, SPOT,
+    )
+    sr_mid  = build_bull_call_spread(*args, sigma=0.65, r=0.0, cost_model=ZERO_COSTS, price_mode="mid")
+    sr_exec = build_bull_call_spread(*args, sigma=0.65, r=0.0, cost_model=ZERO_COSTS, price_mode="executable")
+    assert sr_mid is not None and sr_exec is not None
+    # Debito ejecutable > debito mid (buy al ask, sell al bid)
+    assert sr_exec.net_debit > sr_mid.net_debit
+    # EV ejecutable <= EV mid (cost mas alto → menos edge)
+    assert sr_exec.expected_value <= sr_mid.expected_value + 1.0   # margen de redondeo
+
+
+# ── v2.6: Greeks netos ────────────────────────────────────────────────────────
+
+from datetime import date, timedelta
+
+_EXPIRY_GK = date(2026, 6, 20) + timedelta(days=30)
+_DAYS_GK   = 30
+_SPOT_GK   = 8300.0
+_SIGMA_GK  = 0.60
+
+
+def _bull_call():
+    return build_bull_call_spread(
+        "A", 8000.0, 290.0, 310.0,
+        "B", 8500.0, 130.0, 150.0,
+        _EXPIRY_GK, _DAYS_GK, _SPOT_GK,
+        sigma=_SIGMA_GK, r=0.0, cost_model=ZERO_COSTS,
+    )
+
+
+def _bear_call():
+    return build_bear_call_spread(
+        "A", 8000.0, 290.0, 310.0,
+        "B", 8500.0, 130.0, 150.0,
+        _EXPIRY_GK, _DAYS_GK, _SPOT_GK,
+        sigma=_SIGMA_GK, r=0.0, cost_model=ZERO_COSTS,
+    )
+
+
+def _bull_put():
+    # short K_hi=8500 (ITM put, más caro): bid=420 / ask=440
+    # long  K_lo=8000 (OTM put, más barato): bid=110 / ask=130
+    return build_bull_put_spread(
+        "A", 8500.0, 420.0, 440.0,
+        "B", 8000.0, 110.0, 130.0,
+        _EXPIRY_GK, _DAYS_GK, _SPOT_GK,
+        sigma=_SIGMA_GK, r=0.0, cost_model=ZERO_COSTS,
+    )
+
+
+def test_spread_has_net_greeks_fields():
+    """SpreadResult debe tener net_delta, net_theta, net_vega como float."""
+    sr = _bull_call()
+    assert sr is not None
+    assert isinstance(sr.net_delta, float)
+    assert isinstance(sr.net_theta, float)
+    assert isinstance(sr.net_vega,  float)
+
+
+def test_bull_call_net_delta_positive():
+    """Bull call (alcista) → delta neto positivo siempre (más call larga)."""
+    sr = _bull_call()
+    assert sr is not None
+    assert sr.net_delta > 0.0, f"delta={sr.net_delta} debe ser >0 en bull call"
+
+
+def test_bull_put_net_vega_negative():
+    """Bull put (credit, short IV) → vega neto negativo (spread corto de vol)."""
+    sr = _bull_put()
+    assert sr is not None
+    # Short put K_hi tiene más vega que long put K_lo → net_vega = vega(long) - vega(short) < 0
+    assert sr.net_vega < 0.0, f"vega={sr.net_vega} debe ser <0 para credit spread (short vol)"
+
+
+def test_credit_spread_net_theta_positive():
+    """Bull put con short leg cerca del ATM → theta neto positivo."""
+    sr = _bull_put()
+    assert sr is not None
+    # short K_hi=8500 (2.4% ITM) mas cerca de ATM que long K_lo=8000 (3.6% OTM)
+    # → |theta(short)| > |theta(long)| → net_theta > 0
+    assert sr.net_theta > 0.0, f"theta={sr.net_theta} esperaba >0 para bull put con short cerca ATM"
+
+
+# ── v2.7: BEAR_CALL / BEAR_PUT Greeks ────────────────────────────────────────
+
+def test_bear_call_net_delta_negative():
+    """Bear call (bajista, short K_lo) → delta neto negativo."""
+    sr = _bear_call()
+    assert sr is not None
+    # long leg = K_hi=8500, short leg = K_lo=8000
+    # net_delta = delta(long K8500) - delta(short K8000); short K8000 mas ATM → net < 0
+    assert sr.net_delta < 0.0, f"delta={sr.net_delta} debe ser <0 en bear call"
+
+
+def test_bear_put_net_vega_positive():
+    """Bear put (debito, compra vol) → vega neto positivo."""
+    expiry = date(2026, 6, 20) + timedelta(days=30)
+    sr = build_bear_put_spread(
+        "A", 8500.0, 390.0, 410.0,   # long (bought)
+        "B", 8000.0, 110.0, 130.0,   # short (sold)
+        expiry, 30, 8300.0,
+        sigma=0.60, r=0.0, cost_model=ZERO_COSTS,
+    )
+    assert sr is not None
+    # long K_hi=8500 tiene mas vega que short K_lo=8000 → net_vega > 0
+    assert sr.net_vega > 0.0, f"vega={sr.net_vega} debe ser >0 para bear put (debit, long vol)"

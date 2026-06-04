@@ -1,0 +1,22 @@
+[Unit]
+Description=OptionsDesk — Streamlit dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=optionsdesk
+WorkingDirectory=/opt/optionsdesk
+EnvironmentFile=/opt/optionsdesk/.env
+ExecStart=/opt/optionsdesk/.venv/bin/streamlit run optionsdesk/ui/dashboard.py \
+    --server.port 8501 \
+    --server.address 127.0.0.1 \
+    --server.headless true \
+    --browser.gatherUsageStats false
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
