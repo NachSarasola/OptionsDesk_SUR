@@ -356,6 +356,45 @@ def blocked_strategies(
     return {e.strategy.upper() for e in edges if e.verdict == Verdict.NO_EDGE}
 
 
+def blocked_grades(
+    data_dir: Optional[Path] = None,
+    *,
+    min_sample: int = _MIN_SAMPLE,
+    since: "Union[str, date, datetime, None]" = None,
+) -> set[str]:
+    """Grades SMC (S/A/B/C/D) con edge realizado negativo y muestra suficiente.
+
+    El grade AGREGA muestra a través de setups → aprende el piso de calidad más
+    rápido que el bloqueo por setup. Si grade C/D pierde de forma probada, el sistema
+    sube la vara y deja de operar ese nivel. Los grades nuevos nunca se bloquean.
+    """
+    trades = load_all_closed_trades(data_dir, since=since)
+    return {
+        e.strategy.split()[-1]
+        for e in attribute_by_grade(trades, min_sample=min_sample)
+        if e.verdict == Verdict.NO_EDGE
+    }
+
+
+def block_lists(
+    data_dir: Optional[Path] = None,
+    *,
+    min_sample: int = _MIN_SAMPLE,
+    since: "Union[str, date, datetime, None]" = None,
+) -> tuple[set[str], set[str]]:
+    """(setups_bloqueados, grades_bloqueados) en una sola pasada de datos.
+
+    Fuente única de verdad para 'qué señal es basura', consultada por el demo y el
+    panel. Una señal se bloquea si su setup O su grade probaron edge negativo.
+    """
+    trades = load_all_closed_trades(data_dir, since=since)
+    setups = {e.strategy.upper() for e in attribute(trades, min_sample=min_sample)
+              if e.verdict == Verdict.NO_EDGE}
+    grades = {e.strategy.split()[-1] for e in attribute_by_grade(trades, min_sample=min_sample)
+              if e.verdict == Verdict.NO_EDGE}
+    return setups, grades
+
+
 def is_strategy_blocked(
     strategy: str,
     edges: list[StrategyEdge],

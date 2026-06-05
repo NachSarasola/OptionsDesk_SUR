@@ -216,7 +216,7 @@ class TestRotationOpportunity:
 
         # Posición con TNA residual baja (capture = 60%, DTE largo)
         pos = _pos(
-            premium_received=300.0, strike=9000.0, net_outlay=8700.0 if False else 9000.0,
+            premium_received=300.0, strike=9000.0,
             days_entry=60, days_held=30,  # 30 DTE restantes
             target_capture_pct=50.0,
         )

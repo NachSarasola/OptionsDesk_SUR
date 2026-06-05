@@ -673,21 +673,39 @@ def _apply_directional_boost(
             elif trend == "bajista" and result.strategy == "COVERED_CALL":
                 adj += 3.0
 
-        # ── SMC overlay (v2.4) ────────────────────────────────────────────────
+        # ── SmcSignal boost (v2.5) — usa el output del cascade multi-TF ──────────
         smc = getattr(context, "smc", None)
         if smc is not None:
-            smc_adj = _smc_boost(result, smc)
-            adj += max(-3.0, min(3.0, smc_adj))   # capped ±3 pts
+            sig = getattr(smc, "signal", None)
+            if sig is not None:
+                # SmcSignal.quality calibra la magnitud del boost
+                _QUALITY_BOOST = {"S": 8.0, "A": 6.0, "B": 4.0, "C": 2.0, "none": 0.0}
+                q_boost = _QUALITY_BOOST.get(getattr(sig, "quality", "none"), 0.0)
+                favors_sp = getattr(sig, "favors_short_put", False)
+                favors_cc = getattr(sig, "favors_covered_call", False)
+                favors_wait = getattr(sig, "favors_wait", True)
+
+                if favors_sp and result.strategy == "SHORT_PUT":
+                    adj += q_boost
+                elif favors_cc and result.strategy == "COVERED_CALL":
+                    adj += q_boost * 0.85   # CC levemente menos agressivo
+                elif favors_wait:
+                    # Sin señal clara → reducir confianza (no bloquear, solo enfriar)
+                    adj -= 1.5
+            else:
+                # Fallback al boost v2.4 si no hay SmcSignal
+                smc_adj = _smc_boost(result, smc)
+                adj += max(-3.0, min(3.0, smc_adj))
 
         boosted.append((result, s + adj))
     return boosted
 
 
 def _smc_boost(result: "RateResult", smc: object) -> float:  # type: ignore[type-arg]
-    """Boost incremental basado en zona PDA y sweeps del SmcContext.
+    """Boost fallback basado en zona PDA y sweeps (usado cuando SmcSignal no está disponible).
 
-    No importa SmcContext directamente para evitar import circular con recommender.
-    Accede a los atributos por nombre (duck typing).
+    Mantenido por compatibilidad. Con SmcSignal activo, `_apply_directional_boost`
+    usa el path de quality-calibrated boost y este fallback no se llama.
     """
     adj = 0.0
     pda = getattr(smc, "pda", None)
@@ -698,11 +716,10 @@ def _smc_boost(result: "RateResult", smc: object) -> float:  # type: ignore[type
     if pda is not None:
         zone = getattr(pda, "zone", None)
         if zone == "discount" and result.strategy == "SHORT_PUT":
-            adj += 2.0   # discount → comprar puts baratos tiene más margen
+            adj += 2.0
         elif zone == "premium" and result.strategy == "COVERED_CALL":
-            adj += 2.0   # premium → call cubierta con colchón más amplio
+            adj += 2.0
 
-        # Cerca de SSL/BSL no mitigado
         strike = result.strike
         for lv in liquidity:
             lv_price = getattr(lv, "price", 0.0)
@@ -711,21 +728,20 @@ def _smc_boost(result: "RateResult", smc: object) -> float:  # type: ignore[type
             if lv_swept:
                 continue
             dist_pct = abs(strike - lv_price) / max(lv_price, 1e-9)
-            if dist_pct < 0.03:   # strike dentro del 3% del nivel de liquidez
+            if dist_pct < 0.03:
                 if lv_kind == "SSL" and result.strategy == "SHORT_PUT":
-                    adj += 1.0   # short put en zona de SSL → precio puede rebotar ahí
+                    adj += 1.0
                 elif lv_kind == "BSL" and result.strategy == "COVERED_CALL":
-                    adj += 1.0   # covered call en zona de BSL → posible resistencia
+                    adj += 1.0
 
-    # Sweeps recientes con reversión confirmada
     for sw in sweeps:
         sw_reversed  = getattr(sw, "reversed", False)
         sw_direction = getattr(sw, "direction", "")
         if not sw_reversed:
             continue
         if sw_direction == "down" and result.strategy == "SHORT_PUT":
-            adj += 1.0   # stop hunt bajista + reversión → alcista confirmado
+            adj += 1.0
         elif sw_direction == "up" and result.strategy == "COVERED_CALL":
-            adj += 1.0   # stop hunt alcista + reversión → bajista confirmado
+            adj += 1.0
 
     return adj

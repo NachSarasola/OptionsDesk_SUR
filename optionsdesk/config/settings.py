@@ -340,6 +340,11 @@ class Settings:
     adr_ccl_enabled: bool = field(
         default_factory=lambda: _env_bool("ADR_CCL_ENABLED", False)
     )
+    # Breakout en pesos que el ADR no confirma (fx_driven) = espejismo CCL.
+    # True (default) → bloqueo duro. False → solo penalización -15 pts.
+    adr_ccl_hard_block_breakout: bool = field(
+        default_factory=lambda: _env_bool("ADR_CCL_HARD_BLOCK_BREAKOUT", True)
+    )
     # EMAs del Market Maker Method (vol 2)
     mm_ema_periods: tuple = field(
         default_factory=lambda: (5, 13, 50, 200)

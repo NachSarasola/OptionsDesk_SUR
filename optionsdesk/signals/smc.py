@@ -42,6 +42,19 @@ _EQL_TOLERANCE = 0.005   # 0.5%
 _PDA_LOOKBACK = 60
 
 
+def _learned(name: str, default: float) -> float:
+    """Lee un parametro aprendido por el learner; default si no hay (==hoy).
+
+    Import perezoso para no acoplar smc.py a backtest en import-time y para que
+    cualquier fallo degrade silenciosamente al valor de fabrica.
+    """
+    try:
+        from optionsdesk.backtest.param_store import param
+        return param(name, default)
+    except Exception:
+        return default
+
+
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -102,11 +115,18 @@ class LiquiditySweep:
 
     Un sweep es cuando el precio cruza brevemente un nivel de liquidez pero cierra
     de vuelta del lado original → falso quiebre → señal de reversión potencial.
+
+    Adaptación MERVAL: en un mercado ilíquido (BYMA) un "barrido" puede ser un
+    air-pocket de book vacío (nadie vendió deliberadamente, simplemente no había
+    puntas). `volume_confirmed` distingue un barrido institucional real (alto volumen)
+    de uno por falta de liquidez. Solo confiar en sweeps con volume_confirmed=True
+    para señales de alta calidad (SMC_REVERSAL, sniper entry).
     """
     level: LiquidityLevel
     direction: str    # "up" (barrió BSL) | "down" (barrió SSL)
     reversed: bool    # True si cerró de vuelta (confirmación de stop hunt)
     bar_index: int    # posición en el df donde ocurrió
+    volume_confirmed: bool = False   # True si la vela del barrido tuvo volumen > media
 
 
 @dataclass
@@ -127,6 +147,62 @@ class MmRead:
     peak_formation: bool  # True si hay retest de swing extremo reciente
     phase: str            # "acumulacion"|"manipulacion"|"distribucion"|"desarrollo"
     ema13_cross_50: str   # "above" | "below" | "crossing"
+
+
+@dataclass
+class SmcSignal:
+    """Output de trading unificado — responde qué hacer, desde dónde y hasta dónde.
+
+    Es el resultado del cascade multi-timeframe adaptado al MERVAL:
+      Weekly (bias) → Daily (zona + estructura) → Volumen + Divergencia (confirmación)
+
+    Diseño:
+    - `direction`: "long" | "short" | "neutral"
+    - `quality`:   "S" | "A" | "B" | "C" | "none"  (como signal_grade en stocks)
+    - `favors_short_put`:    True cuando el contexto favorece vender puts de GGAL
+    - `favors_covered_call`: True cuando el contexto favorece lanzar calls cubiertos
+
+    Quality mapping:
+      S — htf_long + discount + OTE + (ssl_sweep_volumed OR rsi_bull_div) + BOS_UP
+      A — htf_long + (discount + BOS_UP) OR (ssl_sweep + discount)
+      B — htf_long + BOS_UP (sin zona precisa)
+      C — señal local sin confirmación HTF (solo para renta, no acciones)
+      none — conflicto o sin datos
+    """
+    direction: str = "neutral"      # "long" | "short" | "neutral"
+    quality: str   = "none"         # "S" | "A" | "B" | "C" | "none"
+
+    # Zona de entrada
+    entry_lo: float = 0.0
+    entry_hi: float = 0.0
+    entry_label: str = ""           # "OTE bullish $X–$Y" | "OB bullish $X–$Y"
+
+    # Target (próxima zona de liquidez a barrer)
+    target: float = 0.0
+    target_label: str = ""          # "BSL PWH $X" | "BSL PDH $X"
+
+    # Stop (invalidación estructural)
+    stop: float = 0.0
+    stop_label: str = ""            # "Bajo OTE 0.886 $X" | "Bajo OB $X"
+
+    # Factores que componen la señal
+    htf_bias: str = "neutral"       # "long" | "short" | "neutral" (weekly)
+    pda_zone: str = "equilibrium"   # "discount" | "premium" | "equilibrium"
+    rsi_div: str = "none"           # "bullish" | "bearish" | "none"
+    ssl_sweep: bool = False         # sweep SSL con reversión en los últimos 5 días
+    bsl_sweep: bool = False         # sweep BSL con reversión
+    vol_confirmed: bool = False     # RVOL > 1.3 en la vela de señal (si daily)
+    obv_alcista: bool = False       # OBV acumulando (posición silenciosa)
+    killzone_active: bool = False
+    in_ote: bool = False            # spot actual dentro de la zona OTE
+
+    # Texto explicativo
+    reason: str = ""
+
+    # Flags de opciones — responde directamente qué estrategia usar
+    favors_short_put: bool = False      # vender puts (long bias + discount)
+    favors_covered_call: bool = False   # call cubierto (short/neutral + premium)
+    favors_wait: bool = True            # esperar mejor setup
 
 
 @dataclass
@@ -157,6 +233,8 @@ class SmcContext:
     adr_confluence: Optional[str] = None
     # Armónicos M/W — hook Fase 3 (harmonics.py)
     peak_formations: list = field(default_factory=list)
+    # SmcSignal — output de trading unificado (generado al final de analyze_smc)
+    signal: Optional["SmcSignal"] = None
 
 
 # ── Swing points (fractales) ──────────────────────────────────────────────────
@@ -267,14 +345,15 @@ def _find_equal_clusters(prices: "list | tuple | object") -> list[float]:
     prices_list = list(prices)
     if len(prices_list) < 2:
         return []
+    tol = _learned("smc_eql_tolerance", _EQL_TOLERANCE)
     clusters: list[float] = []
     for p in prices_list:
         fp = float(p)
-        if any(abs(fp - c) / max(abs(c), 1e-9) <= _EQL_TOLERANCE for c in clusters):
+        if any(abs(fp - c) / max(abs(c), 1e-9) <= tol for c in clusters):
             continue
         count = sum(
             1 for q in prices_list
-            if abs(fp - float(q)) / max(abs(float(q)), 1e-9) <= _EQL_TOLERANCE
+            if abs(fp - float(q)) / max(abs(float(q)), 1e-9) <= tol
         )
         if count >= 2:
             clusters.append(fp)
@@ -282,7 +361,8 @@ def _find_equal_clusters(prices: "list | tuple | object") -> list[float]:
 
 
 def _in_cluster(price: float, clusters: list[float]) -> bool:
-    return any(abs(price - c) / max(abs(c), 1e-9) <= _EQL_TOLERANCE for c in clusters)
+    tol = _learned("smc_eql_tolerance", _EQL_TOLERANCE)
+    return any(abs(price - c) / max(abs(c), 1e-9) <= tol for c in clusters)
 
 
 def _dedup_levels(levels: list[LiquidityLevel]) -> list[LiquidityLevel]:
@@ -308,7 +388,7 @@ def pda_array(daily: pd.DataFrame, spot: float) -> Optional[PdaArray]:
     if daily is None or len(daily) < 10:
         return None
 
-    window = daily.tail(_PDA_LOOKBACK)
+    window = daily.tail(int(_learned("smc_pda_lookback", _PDA_LOOKBACK)))
     swings = swing_points(window, length=3)
 
     if swings.empty:
@@ -396,11 +476,18 @@ def detect_sweeps(
     df: pd.DataFrame,
     levels: list[LiquidityLevel],
     lookback: int = 5,
+    volume_mult: float = 1.2,
 ) -> list[LiquiditySweep]:
     """Detecta stop hunts (Turtle Soup) en las últimas `lookback` velas.
 
     Un sweep es: high > nivel_BSL pero close < nivel_BSL → posible reversal bajista.
     O:           low < nivel_SSL pero close > nivel_SSL → posible reversal alcista.
+
+    `volume_confirmed`: la vela del barrido tiene volumen >= `volume_mult`× la media
+    del resto del lookback. Solo aplica cuando hay datos de volumen reales (daily).
+    El tape intradía de BYMA tiene volume=0, así que no filtra falsamente.
+    En BYMA ilíquido, un sweep sin volumen es probablemente un air-pocket de book
+    vacío, no un barrido institucional real.
     """
     sweeps: list[LiquiditySweep] = []
     if df is None or len(df) < 2:
@@ -409,12 +496,27 @@ def detect_sweeps(
     check = df.tail(lookback + 1).reset_index(drop=True)
     offset = max(0, len(df) - lookback - 1)
 
+    # Pre-computar la media de volumen del lookback para confirmar barridos.
+    has_volume = "volume" in df.columns
+    vol_mean = 0.0
+    if has_volume:
+        vol_series = df["volume"].astype(float)
+        vol_mean = float(vol_series.tail(lookback + 10).mean() or 0.0)
+
     for lv in levels:
         p = lv.price
         for i, bar in check.iterrows():
             bar_hi = float(bar["high"])
             bar_lo = float(bar["low"])
             bar_cl = float(bar["close"])
+            bar_vol = float(bar.get("volume", 0.0) or 0.0) if has_volume else 0.0
+
+            # volume_confirmed: volumen real presente y superior a la media.
+            vol_conf = (
+                bar_vol > 0
+                and vol_mean > 0
+                and bar_vol >= vol_mean * volume_mult
+            ) if has_volume and vol_mean > 0 else False
 
             if lv.kind == "BSL" and bar_hi > p * 1.001:
                 sweeps.append(LiquiditySweep(
@@ -422,6 +524,7 @@ def detect_sweeps(
                     direction="up",
                     reversed=bar_cl < p,
                     bar_index=offset + int(i),
+                    volume_confirmed=vol_conf,
                 ))
             elif lv.kind == "SSL" and bar_lo < p * 0.999:
                 sweeps.append(LiquiditySweep(
@@ -429,6 +532,7 @@ def detect_sweeps(
                     direction="down",
                     reversed=bar_cl > p,
                     bar_index=offset + int(i),
+                    volume_confirmed=vol_conf,
                 ))
 
     return sweeps
@@ -684,4 +788,473 @@ def analyze_smc(
     except Exception as exc:
         logger.debug("harmonics fallo: %s", exc)
 
+    # SmcSignal — señal de trading directa (multi-TF cascade)
+    try:
+        ctx.signal = generate_smc_signal(ctx, weekly_daily=weekly, spot=_spot, daily=daily)
+    except Exception as exc:
+        logger.debug("generate_smc_signal fallo: %s", exc)
+
     return ctx
+
+
+# ── RSI Divergence ────────────────────────────────────────────────────────────
+
+def rsi_divergence(daily: pd.DataFrame, length: int = 14, lookback: int = 12) -> str:
+    """Detecta divergencia RSI/precio — funciona bien en MERVAL (bajo ruido).
+
+    Bullish: precio hace mínimo más bajo pero RSI hace mínimo más alto → reversión.
+    Bearish: precio hace máximo más alto pero RSI hace máximo más bajo → distribución.
+
+    En MERVAL, la divergencia bullish en zona discount + SSL sweep = sniper entry.
+    En MERVAL, la divergencia bearish en zona premium = distribución institucional.
+    """
+    try:
+        from optionsdesk.signals.technical import rsi as _rsi_fn
+    except ImportError:
+        return "none"
+
+    if daily is None or len(daily) < length + lookback:
+        return "none"
+
+    close  = daily["close"].astype(float)
+    rsi_s  = _rsi_fn(close, length).dropna()
+    if len(rsi_s) < lookback:
+        return "none"
+
+    half     = max(lookback // 2, 3)
+    # Ventana reciente (segunda mitad) vs anterior (primera mitad)
+    prev_cl  = close.iloc[-lookback : -half]
+    last_cl  = close.iloc[-half:]
+    prev_rsi = rsi_s.iloc[-lookback : -half]
+    last_rsi = rsi_s.iloc[-half:]
+
+    if prev_cl.empty or last_cl.empty or prev_rsi.empty or last_rsi.empty:
+        return "none"
+
+    # Bullish divergence: precio hace mínimo más bajo, RSI no confirma
+    if (float(last_cl.min()) < float(prev_cl.min()) * 0.995
+            and float(last_rsi.min()) > float(prev_rsi.min()) + 1.5):
+        return "bullish"
+
+    # Bearish divergence: precio hace máximo más alto, RSI no confirma
+    if (float(last_cl.max()) > float(prev_cl.max()) * 1.005
+            and float(last_rsi.max()) < float(prev_rsi.max()) - 1.5):
+        return "bearish"
+
+    return "none"
+
+
+# ── Volume context from volume_momentum ──────────────────────────────────────
+
+def _volume_context(daily: pd.DataFrame) -> dict:
+    """Extrae RVOL, OBV trend y confirmación de volumen (solo en daily con vol real).
+
+    Delega a volume_momentum.py (RVOL / OBV / vol_trend). Retorna dict vacío
+    si volume_momentum no está disponible o el volumen es 0 (intradía BYMA).
+    """
+    if daily is None or len(daily) < 5:
+        return {}
+    if "volume" not in daily.columns or float(daily["volume"].iloc[-1]) == 0:
+        return {}
+    try:
+        from optionsdesk.signals.volume_momentum import volume_snapshot, volume_score_delta
+        snap = volume_snapshot(daily)
+        if snap is None:
+            return {}
+        delta, notes = volume_score_delta(snap)
+        return {
+            "rvol": snap.rvol,
+            "rvol_label": snap.rvol_label,
+            "obv_trend": snap.obv_trend,
+            "obv_divergence": snap.obv_divergence,
+            "price_vol_ok": snap.price_vol_ok,
+            "vol_score_delta": delta,
+        }
+    except Exception:
+        return {}
+
+
+# ── SmcSignal cascade ─────────────────────────────────────────────────────────
+
+def generate_smc_signal(
+    ctx: SmcContext,
+    weekly_daily: Optional[pd.DataFrame] = None,
+    daily: Optional[pd.DataFrame] = None,
+    spot: float = 0.0,
+) -> SmcSignal:
+    """Cascade multi-timeframe → SmcSignal de trading directo.
+
+    Jerarquía de pesos (adaptada al MERVAL):
+    1. HTF bias (semanal)  — nunca operar contra la tendencia semanal
+    2. Zona PDA (diario)   — discount para longs, premium para shorts
+    3. Estructura (BOS)    — confirmación direccional
+    4. OTE                 — zona de entrada óptima
+    5. Sweeps + Volumen    — confirman que el movimiento es institucional
+    6. RSI divergencia     — confirmación adicional de reversión
+    7. Killzone            — timing (esperar fuera de apertura)
+
+    Para opciones GGAL:
+    - favors_short_put:    long bias + discount + BOS_UP (sin conflicto)
+    - favors_covered_call: short/neutral bias + premium + (BOS_DOWN or CHoCH_DOWN)
+    """
+    sig = SmcSignal()
+
+    # ── 1. HTF bias — weekly primero, fallback a EMA50 del diario ────────────
+    # Sin datos semanales, EMA50 del diario es el mejor proxy de tendencia "macro".
+    # Si price > EMA50 → contexto alcista de mediano plazo. <EMA50 → bajista.
+    htf_bias = "neutral"
+    if weekly_daily is not None and len(weekly_daily) >= 8:
+        try:
+            from optionsdesk.signals.technical import analyze as _analyze_w
+            w_snap = _analyze_w(weekly_daily)
+            t = getattr(w_snap, "trend", "LATERAL")
+            if t == "ALCISTA":
+                htf_bias = "long"
+            elif t == "BAJISTA":
+                htf_bias = "short"
+        except Exception:
+            pass
+
+    if htf_bias == "neutral" and daily is not None and len(daily) >= 50 and spot > 0:
+        try:
+            from optionsdesk.signals.technical import ema as _ema_htf
+            e50 = float(_ema_htf(daily["close"].astype(float), 50).iloc[-1])
+            if not pd.isna(e50):
+                if spot > e50 * 1.015:      # más del 1.5% arriba → alcista
+                    htf_bias = "long"
+                elif spot < e50 * 0.985:    # más del 1.5% abajo → bajista
+                    htf_bias = "short"
+        except Exception:
+            pass
+
+    sig.htf_bias = htf_bias
+
+    # ── 2. PDA zone ───────────────────────────────────────────────────────────
+    pda = ctx.pda
+    pda_zone = getattr(pda, "zone", "equilibrium") if pda is not None else "equilibrium"
+    sig.pda_zone = pda_zone
+
+    # ── 3. Estructura (BOS/CHoCH) ─────────────────────────────────────────────
+    bos   = ctx.bos or ""
+    choch = ctx.choch or ""
+
+    # ── 4. OTE — usa los campos OTE del PDA (impulso primario), no ctx.ote ────
+    # ctx.ote rastrea el ÚLTIMO swing (puede ser la corrección bajista).
+    # Para un trade LONG, lo relevante es si el precio está en la zona OTE del
+    # IMPULSO PRIMARIO (0.618–0.786 del rango PDA), no de la corrección actual.
+    in_ote = False
+    ote_lo_ref = 0.0
+    ote_hi_ref = 0.0
+    if pda is not None and spot > 0:
+        if pda_zone in ("discount", "equilibrium"):
+            # Long: OTE = 0.618–0.786 del rango PDA (zona de compra en el pullback)
+            ote_lo_ref = getattr(pda, "ote_bullish_lo", 0.0)
+            ote_hi_ref = getattr(pda, "ote_bullish_hi", 0.0)
+            # Deep discount (debajo del OTE) también es zona válida con mayor riesgo
+            in_ote = ote_lo_ref <= spot <= ote_hi_ref
+        else:
+            # Short: OTE = 0.786–0.886 del rango PDA (rebote en zona premium)
+            ote_lo_ref = getattr(pda, "ote_bearish_lo", 0.0)
+            ote_hi_ref = getattr(pda, "ote_bearish_hi", 0.0)
+            in_ote = ote_lo_ref <= spot <= ote_hi_ref
+    sig.in_ote = in_ote
+
+    # ── 5. Sweeps ────────────────────────────────────────────────────────────
+    sweeps = ctx.sweeps or []
+    ssl_sweep = any(
+        getattr(sw, "direction", "") == "down"
+        and getattr(sw, "reversed", False)
+        for sw in sweeps
+    )
+    bsl_sweep = any(
+        getattr(sw, "direction", "") == "up"
+        and getattr(sw, "reversed", False)
+        for sw in sweeps
+    )
+    # En MERVAL: sweep con volume_confirmed vale el doble (institucional real)
+    ssl_sweep_vol = any(
+        getattr(sw, "direction", "") == "down"
+        and getattr(sw, "reversed", False)
+        and getattr(sw, "volume_confirmed", False)
+        for sw in sweeps
+    )
+    sig.ssl_sweep = ssl_sweep
+    sig.bsl_sweep = bsl_sweep
+
+    # ── 6. Volumen (RVOL + OBV) ───────────────────────────────────────────────
+    vol = _volume_context(daily) if daily is not None else {}
+    rvol        = vol.get("rvol") or 1.0
+    obv_trend   = vol.get("obv_trend", "lateral")
+    price_vol_ok = vol.get("price_vol_ok", False)
+    rvol_threshold = float(_learned("smc_rvol_threshold", 1.30))
+    vol_confirmed  = rvol >= rvol_threshold and price_vol_ok
+    sig.vol_confirmed = vol_confirmed
+    sig.obv_alcista   = obv_trend == "alcista"
+
+    # ── 7. RSI divergence ─────────────────────────────────────────────────────
+    rsi_div = rsi_divergence(daily) if daily is not None else "none"
+    sig.rsi_div = rsi_div
+
+    # ── 8. Killzone ───────────────────────────────────────────────────────────
+    sig.killzone_active = ctx.killzone == "manipulacion"   # distribución no bloquea
+
+    # ── DIRECTION y QUALITY — cascade ─────────────────────────────────────────
+    # Contamos puntos de confluencia
+    bull_points = 0
+    bear_points = 0
+
+    # HTF (peso 3 — más importante)
+    if htf_bias == "long":
+        bull_points += 3
+    elif htf_bias == "short":
+        bear_points += 3
+
+    # PDA zone (peso 2)
+    if pda_zone == "discount":
+        bull_points += 2
+    elif pda_zone == "premium":
+        bear_points += 2
+
+    # BOS (peso 2)
+    if bos == "BOS_UP":
+        bull_points += 2
+    elif bos == "BOS_DOWN":
+        bear_points += 2
+
+    # CHoCH (peso 1 — señal de cambio, no confirmación)
+    if choch == "CHOCH_UP":
+        bull_points += 1
+    elif choch == "CHOCH_DOWN":
+        bear_points += 1
+
+    # OTE bullish (peso 2) / bearish (peso 2)
+    if in_ote and ote is not None:
+        if getattr(ote, "direction", "") == "bullish":
+            bull_points += 2
+        else:
+            bear_points += 2
+
+    # Sweeps (peso 2 — evidencia de stop hunt)
+    if ssl_sweep:
+        bull_points += 2
+    if bsl_sweep:
+        bear_points += 2
+    # Bonus por volumen confirmado en el sweep
+    if ssl_sweep_vol:
+        bull_points += 1
+
+    # RSI divergence (peso 1)
+    if rsi_div == "bullish":
+        bull_points += 1
+    elif rsi_div == "bearish":
+        bear_points += 1
+
+    # OBV acumulación silenciosa (peso 1)
+    if sig.obv_alcista:
+        bull_points += 1
+    elif obv_trend == "bajista":
+        bear_points += 1
+
+    # Volume confirmado en precio (peso 1)
+    if vol_confirmed:
+        if pda_zone == "discount":
+            bull_points += 1
+        elif pda_zone == "premium":
+            bear_points += 1
+
+    # ADR confluence (peso 1 — solo si disponible)
+    adr = getattr(ctx, "adr_confluence", None)
+    if adr == "confirmed":
+        # ADR confirma → suma a whichever direction is dominant
+        if bull_points > bear_points:
+            bull_points += 1
+        else:
+            bear_points += 1
+    elif adr == "fx_driven":
+        # Movimiento por CCL → reduce confianza en cualquier dirección
+        bull_points = max(0, bull_points - 1)
+        bear_points = max(0, bear_points - 1)
+
+    # Determinar dirección
+    margin = bull_points - bear_points
+    if margin >= 3:
+        direction = "long"
+    elif margin <= -3:
+        direction = "short"
+    else:
+        direction = "neutral"
+    sig.direction = direction
+
+    # Quality scoring — MERVAL calibrado
+    # S: señal de libro (todo alineado: HTF + zona + estructura + sweep o RSI)
+    # A: HTF + zona + estructura
+    # B: HTF + estructura (sin zona precisa)
+    # C: señal local sin HTF
+    if direction == "long":
+        has_structure = (bos == "BOS_UP" or choch == "CHOCH_UP")
+        has_zone      = (pda_zone == "discount" or in_ote)
+        has_reversal  = (ssl_sweep or rsi_div == "bullish")
+        if htf_bias == "long" and has_zone and has_structure and has_reversal:
+            quality = "S"
+        elif htf_bias == "long" and has_zone and has_structure:
+            quality = "A"
+        elif htf_bias == "long" and has_structure:
+            quality = "B"
+        elif has_structure and has_reversal:
+            quality = "C"
+        else:
+            quality = "none"
+    elif direction == "short":
+        has_structure = (bos == "BOS_DOWN" or choch == "CHOCH_DOWN")
+        has_zone      = (pda_zone == "premium" or in_ote)
+        has_reversal  = (bsl_sweep or rsi_div == "bearish")
+        if htf_bias == "short" and has_zone and has_structure and has_reversal:
+            quality = "S"
+        elif htf_bias == "short" and has_zone and has_structure:
+            quality = "A"
+        elif htf_bias == "short" and has_structure:
+            quality = "B"
+        elif has_structure and has_reversal:
+            quality = "C"
+        else:
+            quality = "none"
+    else:
+        quality = "none"
+
+    sig.quality = quality
+
+    # ── Entry / Target / Stop ─────────────────────────────────────────────────
+    _spot = spot if spot > 0 else 0.0
+    if direction != "neutral" and _spot > 0:
+        _fill_entry_target_stop(sig, ctx, direction, _spot)
+
+    # ── Flags de opciones ─────────────────────────────────────────────────────
+    # SHORT PUT: óptimo cuando el precio probablemente sube.
+    # Umbrales más permisivos que acciones porque el vendedor de opciones tiene
+    # el tiempo a favor — puede ganar aunque la dirección no sea perfecta.
+    # Quality C se incluye: una señal local sin HTF es suficiente para renta.
+    sig.favors_short_put = (
+        direction == "long"
+        and quality in ("S", "A", "B", "C")
+        and pda_zone in ("discount", "equilibrium")
+        and bos != "BOS_DOWN"           # sin estructura bajista confirmada
+        and choch != "CHOCH_DOWN"       # sin giro de carácter bajista
+        and not sig.killzone_active
+    )
+
+    # COVERED CALL: óptimo cuando el precio probablemente se frena o baja.
+    # Cualquier señal moderada-débil con premium zone ya justifica la estrategia.
+    sig.favors_covered_call = (
+        direction in ("short", "neutral")
+        and quality in ("S", "A", "B", "C")
+        and pda_zone in ("premium", "equilibrium")
+        and bos != "BOS_UP"
+        and choch != "CHOCH_UP"
+        and not sig.killzone_active
+    )
+
+    sig.favors_wait = not (sig.favors_short_put or sig.favors_covered_call)
+
+    # ── Reason (legible en castellano) ────────────────────────────────────────
+    parts: list[str] = []
+    if htf_bias != "neutral":
+        parts.append(f"Semanal {htf_bias}")
+    if pda_zone != "equilibrium":
+        parts.append(f"zona {pda_zone}")
+    if bos:
+        parts.append(bos.replace("_", " ").lower())
+    if in_ote:
+        parts.append("precio en OTE")
+    if ssl_sweep:
+        parts.append("stop-hunt SSL + reversal")
+    if rsi_div != "none":
+        parts.append(f"RSI divergencia {rsi_div}")
+    if sig.obv_alcista:
+        parts.append("OBV acumulando")
+    if sig.killzone_active:
+        parts.append("ESPERAR: killzone apertura activa")
+    sig.reason = "  ·  ".join(parts) if parts else "sin confluencia suficiente"
+
+    return sig
+
+
+def _fill_entry_target_stop(
+    sig: SmcSignal,
+    ctx: SmcContext,
+    direction: str,
+    spot: float,
+) -> None:
+    """Rellena entry/target/stop del SmcSignal con la mejor información disponible."""
+    liquidity = ctx.liquidity or []
+    ote       = ctx.ote
+    pda       = ctx.pda
+
+    # Entry zone
+    if ote is not None and sig.in_ote:
+        ote_lo  = getattr(ote, "lo", 0.0)
+        ote_hi  = getattr(ote, "hi", 0.0)
+        sig.entry_lo    = ote_lo
+        sig.entry_hi    = ote_hi
+        sig.entry_label = f"OTE {getattr(ote,'direction','')} ${ote_lo:,.0f}–${ote_hi:,.0f}"
+    elif pda is not None:
+        eq = getattr(pda, "equilibrium", spot)
+        if direction == "long":
+            sig.entry_lo    = getattr(pda, "discount_band", spot * 0.98)
+            sig.entry_hi    = eq
+            sig.entry_label = f"zona discount ${sig.entry_lo:,.0f}–${eq:,.0f}"
+        else:
+            sig.entry_lo    = eq
+            sig.entry_hi    = getattr(pda, "premium_band", spot * 1.02)
+            sig.entry_label = f"zona premium ${eq:,.0f}–${sig.entry_hi:,.0f}"
+
+    # Target (próxima liquidez en la dirección del trade)
+    if direction == "long":
+        bsl_candidates = [
+            lv for lv in liquidity
+            if getattr(lv, "kind", "") == "BSL"
+            and not getattr(lv, "swept", True)
+            and getattr(lv, "price", 0) > spot * 1.005
+        ]
+        if bsl_candidates:
+            target_lv   = min(bsl_candidates, key=lambda lv: lv.price)
+            sig.target  = target_lv.price
+            sig.target_label = f"BSL {target_lv.label} ${target_lv.price:,.0f}"
+        elif pda is not None:
+            sh = getattr(pda, "swing_high", 0.0)
+            sig.target       = sh
+            sig.target_label = f"swing_high PDA ${sh:,.0f}"
+    else:
+        ssl_candidates = [
+            lv for lv in liquidity
+            if getattr(lv, "kind", "") == "SSL"
+            and not getattr(lv, "swept", True)
+            and getattr(lv, "price", 0) < spot * 0.995
+        ]
+        if ssl_candidates:
+            target_lv   = max(ssl_candidates, key=lambda lv: lv.price)
+            sig.target  = target_lv.price
+            sig.target_label = f"SSL {target_lv.label} ${target_lv.price:,.0f}"
+        elif pda is not None:
+            sl = getattr(pda, "swing_low", 0.0)
+            sig.target       = sl
+            sig.target_label = f"swing_low PDA ${sl:,.0f}"
+
+    # Stop (invalidación estructural)
+    if ote is not None:
+        f886 = getattr(ote, "fib_886", 0.0)
+        if direction == "long" and f886 > 0:
+            sig.stop       = f886 * 0.993
+            sig.stop_label = f"bajo OTE 0.886 ${f886:,.0f}"
+        elif direction == "short" and f886 > 0:
+            sig.stop       = f886 * 1.007
+            sig.stop_label = f"sobre OTE 0.886 ${f886:,.0f}"
+    if sig.stop == 0.0:
+        # Fallback: 2× ATR del swing bajo/alto
+        if direction == "long" and pda is not None:
+            sl = getattr(pda, "swing_low", 0.0)
+            sig.stop       = sl * 0.995 if sl > 0 else spot * 0.95
+            sig.stop_label = f"bajo swing_low ${sig.stop:,.0f}"
+        elif pda is not None:
+            sh = getattr(pda, "swing_high", 0.0)
+            sig.stop       = sh * 1.005 if sh > 0 else spot * 1.05
+            sig.stop_label = f"sobre swing_high ${sig.stop:,.0f}"

@@ -151,16 +151,20 @@ class IOLExecutor(OrderExecutor):
         return data if isinstance(data, list) else []
 
     def get_positions(self, country: str = "argentina") -> list[dict]:
-        """Tenencia actual de opciones GGAL (para cerrar rapido)."""
+        """Tenencia actual de opciones GGAL y acciones del universo (para monitoreo real)."""
         data, _ = self._request("GET", f"portafolio/{country}")
         if not isinstance(data, dict):
             return []
+            
+        from optionsdesk.config.settings import settings
+        universe = set(s.strip().upper() for s in settings.stock_universe.split(",") if s.strip())
+        
         out: list[dict] = []
         for activo in data.get("activos") or []:
             titulo = activo.get("titulo") or {}
             simbolo = str(titulo.get("simbolo") or "").upper()
             tipo = str(titulo.get("tipo") or "").lower()
-            if not (simbolo.startswith("GFG") or "opc" in tipo):
+            if not (simbolo.startswith("GFG") or "opc" in tipo or simbolo in universe):
                 continue
             out.append({
                 "simbolo": simbolo,

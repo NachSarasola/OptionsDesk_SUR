@@ -26,7 +26,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from optionsdesk.backtest.adaptive import AdaptiveContext, analyze_performance
-from optionsdesk.performance.attribution import blocked_strategies, load_all_closed_trades
+from optionsdesk.performance.attribution import block_lists, load_all_closed_trades
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ class RunnerStatus:
     blocked: list
     half_kelly_pct: float
     note: str
+    regime: str = ""   # regimen vivo + genoma desplegado por la politica del arbol
 
 
 class _PnlTrade:
@@ -123,7 +124,9 @@ def compute_self_learning_state(
     pnls = [float(t.realized_pnl_ars) for t in settled]
 
     adaptive = analyze_performance([_PnlTrade(p) for p in pnls])
-    blocked = blocked_strategies(data_dir, since=since)
+    blocked, blocked_grade = block_lists(data_dir, since=since)
+    if blocked_grade:
+        blocked = blocked | {f"Grade {g}" for g in blocked_grade}
 
     # Drawdown peak-to-trough sobre la ventana RECIENTE (no all-time).
     window = pnls[-lookback:] if lookback and lookback > 0 else pnls
@@ -163,6 +166,27 @@ def run_cycle(
     """Ejecuta un ciclo: aprende, fetchea, tickea ambos demos, persiste status."""
     current = now or datetime.now(_BA)
     state = state or compute_self_learning_state(data_dir=data_dir, capital=capital)
+
+    # Controlador de estrategia (antes del fetch, para que las señales de ESTE ciclo
+    # usen el set desplegado). Jerarquia:
+    #   1. Si hay una POLITICA del arbol (strategy_tree) entrenada → desplegar el
+    #      genoma del REGIMEN vivo (contexto actual). Es el cerebro entrenado.
+    #   2. Si no hay politica → fallback al param_learner 1-D (bootstrap online).
+    # Best-effort: si todo falla, el ciclo opera con los parametros de fabrica.
+    regime_note = ""
+    try:
+        from optionsdesk.backtest.strategy_tree import deploy_for_regime, load_policy_doc
+        if load_policy_doc() is not None:
+            regime = _live_regime()
+            deployed = deploy_for_regime(regime, data_dir=data_dir)
+            regime_note = f"regimen {regime} → {deployed}" if deployed else ""
+        else:
+            from optionsdesk.backtest.param_learner import run_learner_step
+            from optionsdesk.config.settings import settings as _s
+            run_learner_step(data_dir=data_dir, now=current,
+                             since=getattr(_s, "demo_learning_since", None))
+    except Exception as exc:
+        logger.debug("controlador de estrategia falló: %s", exc)
 
     inputs = CycleInputs()
     try:
@@ -219,6 +243,7 @@ def run_cycle(
         blocked=sorted(state.blocked),
         half_kelly_pct=round(state.adaptive.half_kelly_pct, 4),
         note=state.note,
+        regime=regime_note,
     )
     _write_status(status, status_path)
     return status
@@ -245,6 +270,24 @@ def load_runner_status(path: Optional[Path] = None) -> Optional[dict]:
 
 
 # ── Loop continuo ──────────────────────────────────────────────────────────────
+
+def _live_regime() -> str:
+    """Clasifica el regimen de mercado vigente desde el historial diario de GGAL.
+
+    Best-effort: si no hay historial, devuelve UNKNOWN (la politica cae al global).
+    """
+    try:
+        from optionsdesk.data.history import UnderlyingHistory
+        from optionsdesk.backtest.strategy_context import classify_regime, UNKNOWN_REGIME
+        df = UnderlyingHistory().daily("GGAL", days=180, allow_synthetic=False)
+        if df is None or df.empty:
+            return UNKNOWN_REGIME
+        return classify_regime(df)
+    except Exception as exc:
+        logger.debug("_live_regime fallo: %s", exc)
+        from optionsdesk.backtest.strategy_context import UNKNOWN_REGIME
+        return UNKNOWN_REGIME
+
 
 def _market_open(now: datetime) -> bool:
     """Rueda BYMA: lun–vie 11:00–17:00 ART."""

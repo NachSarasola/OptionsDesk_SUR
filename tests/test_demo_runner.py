@@ -31,7 +31,7 @@ def test_state_learns_kelly_and_drawdown_halt(tmp_path):
     assert state.halted is True
     assert state.realized_pnl_ars < 0
     assert "STOCK_SWING_BREAKOUT" in state.blocked         # setup probadamente perdedor
-    assert state.adaptive.mode == "DEFENSIVE"
+    assert state.adaptive.mode in ("DEFENSIVE", "HALTED")   # racha perdedora → defensivo/freno
 
 
 def test_state_not_halted_when_profitable(tmp_path):

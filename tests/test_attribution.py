@@ -93,6 +93,36 @@ def _graded(grade, pnl) -> ClosedTrade:
     )
 
 
+def test_blocked_grades_raises_quality_floor(tmp_path):
+    """Un grade con edge negativo probado (muestra suficiente) se bloquea; el nuevo no."""
+    import json
+    from optionsdesk.performance.attribution import blocked_grades, block_lists
+    rows = [json.dumps({"strategy": "SWING", "signal_type": "SWING_BREAKOUT",
+                        "pnl_ars": -300.0, "score": 70.0, "exit_reason": "STOP"})  # grade B perdedor
+            for _ in range(16)]
+    rows += [json.dumps({"strategy": "SWING", "signal_type": "SWING_BREAKOUT",
+                         "pnl_ars": 500.0, "score": 95.0, "exit_reason": "TP"})    # grade S, pocos
+             for _ in range(3)]
+    (tmp_path / "stock_demo_trades.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    grades = blocked_grades(tmp_path)
+    setups, grades2 = block_lists(tmp_path)
+    assert "B" in grades            # grade B probó perder → piso sube
+    assert "S" not in grades        # grade S nuevo → protegido
+    assert grades == grades2        # block_lists consistente con blocked_grades
+
+
+def test_signal_edge_status_blocks_setup_or_grade():
+    from datetime import datetime
+    from optionsdesk.signals.stock_signals import StockSignal, signal_edge_status
+    sig = StockSignal(symbol="GGAL", strategy="SWING", signal_type="SWING_BREAKOUT",
+                      created_at=datetime(2026, 6, 3), entry_price=100.0, stop_price=95.0,
+                      target_price=110.0, score=70.0, rationale="x")   # score 70 → grade B
+    assert signal_edge_status(sig, set(), set()) == ""                          # nada bloqueado → ok
+    assert signal_edge_status(sig, {"STOCK_SWING_BREAKOUT"}, set()) != ""        # setup bloqueado
+    assert signal_edge_status(sig, set(), {"B"}) != ""                          # grade bloqueado
+
+
 def test_attribute_by_grade_validates_quality_ranking():
     from optionsdesk.performance.attribution import attribute_by_grade
     # Grade S gana, Grade D pierde: el grading SÍ predice → edge S>0, D<=0.

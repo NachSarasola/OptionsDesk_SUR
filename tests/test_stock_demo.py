@@ -63,7 +63,7 @@ def test_stock_demo_opens_at_ask_and_persists_position(tmp_path):
     now = datetime(2026, 6, 3, 11, 30, tzinfo=BA)
     positions = tmp_path / "positions.json"
     trades = tmp_path / "trades.jsonl"
-    quote = _quote("GGAL", 99.0, 100.0, 99.5, now)
+    quote = _quote("GGAL", 99.5, 100.0, 99.75, now)   # spread tight: sin slippage
 
     result = run_stock_demo_tick(
         {"GGAL": quote},
@@ -102,7 +102,7 @@ def test_stock_demo_closes_at_bid_and_appends_trade(tmp_path):
     now = datetime(2026, 6, 3, 11, 30, tzinfo=BA)
     positions = tmp_path / "positions.json"
     trades = tmp_path / "trades.jsonl"
-    entry_quote = _quote("GGAL", 99.0, 100.0, 99.5, now)
+    entry_quote = _quote("GGAL", 99.5, 100.0, 99.75, now)   # spread tight: sin slippage
     exit_quote = _quote("GGAL", 111.0, 112.0, 111.5, now + timedelta(minutes=1))
 
     run_stock_demo_tick({"GGAL": entry_quote}, [_signal("GGAL", now)], now=now, positions_path=positions, trades_path=trades, trade_ars=1_000.0, costs=ZERO_COSTS)

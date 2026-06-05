@@ -41,7 +41,7 @@ def _quote(symbol: str, bid: float, ask: float, last: float, ts: datetime) -> Qu
         bid=bid,
         ask=ask,
         last=last,
-        volume=10_000.0,
+        volume=100_000.0,   # sobre el piso de liquidez BYMA (_MIN_DAILY_VOLUME)
         timestamp=ts,
         source="TEST",
         received_at=ts,
@@ -180,6 +180,26 @@ def test_smc_blocks_breakout_into_unswept_bsl():
     ctx = SmcContext(liquidity=[LiquidityLevel("BSL", 101.0, "PWH", False, "weekly")])
     delta, block, notes = _smc_quality(_swing_sig("SWING_BREAKOUT"), ctx, spot=100.0)
     assert block is not None
+
+
+def test_ccl_hard_blocks_breakout_but_not_pullback():
+    """Un BREAKOUT fx_driven se bloquea duro. Un PULLBACK fx_driven solo se penaliza."""
+    from dataclasses import replace as dc_replace
+    from optionsdesk.signals.smc import SmcContext
+    from optionsdesk.signals.stock_signals import _smc_quality, StockSignal
+    import datetime
+
+    def sig(st): return StockSignal("GGAL","SWING",st,datetime.datetime(2026,6,3),100,95,110,75,"x",
+                                    adr_confluence="fx_driven")
+
+    ctx = SmcContext()
+    _, block_br, _ = _smc_quality(sig("SWING_BREAKOUT"), ctx, 100)
+    d_pull, block_pull, notes_pull = _smc_quality(sig("SWING_TREND_PULLBACK"), ctx, 100)
+
+    assert block_br is not None and "espejismo" in block_br   # breakout bloqueado duro
+    assert block_pull is None                                   # pullback no bloqueado
+    assert d_pull < 0                                          # pullback penalizado suave
+    assert any("CCL" in n or "CCL" in n.upper() for n in notes_pull)
 
 
 def test_no_daily_history_returns_empty():

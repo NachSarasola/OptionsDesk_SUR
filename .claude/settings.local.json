@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/ -q)"
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -m pytest -q --tb=line)",
+      "Bash(python -m optionsdesk.backtest.strategy_tree --symbols GGAL --evals 8 --days 160 --seed 0)"
     ]
   }
 }

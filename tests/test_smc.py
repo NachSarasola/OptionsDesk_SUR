@@ -535,3 +535,209 @@ class TestToggleDisabled:
         ctx = compute_market_context(df)
         # El campo smc debe quedar en None (no se calculó)
         assert getattr(ctx, "smc", None) is None
+
+
+# ── Volumen en sweeps (adaptación MERVAL ilíquido) ────────────────────────────
+
+def _df_with_volume(n: int = 20, sweep_vol_mult: float = 2.0) -> "pd.DataFrame":
+    """DataFrame con volumen realista: vela final tiene volumen alto (sweep real)."""
+    import pandas as pd
+    rows = [{"date": f"2026-0{1+(i//30):1d}-{(i%30)+1:02d}", "open": 100+i, "high": 101+i,
+             "low": 99+i, "close": 100+i, "volume": 1000.0} for i in range(n)]
+    rows[-1]["volume"] = 1000.0 * sweep_vol_mult   # vela del barrido con volumen alto
+    return pd.DataFrame(rows)
+
+
+def test_detect_sweeps_marks_high_volume_as_confirmed():
+    from optionsdesk.signals.smc import LiquidityLevel, LiquiditySweep, detect_sweeps
+    # SSL en 105; la última vela baja a 104 y cierra en 106 (sweep real)
+    df = _df_with_volume(20, sweep_vol_mult=2.5)
+    df.iloc[-1] = {"date": "2026-01-20", "open": 110, "high": 112, "low": 104,
+                   "close": 108, "volume": 2500.0}
+    level = LiquidityLevel("SSL", 105.0, "SWING_L", False, "daily")
+    sweeps = detect_sweeps(df, [level], lookback=3, volume_mult=1.5)
+    vol_sw = [s for s in sweeps if s.volume_confirmed]
+    assert vol_sw, "sweep con volumen alto debe marcarse como confirmado"
+
+
+def test_detect_sweeps_marks_low_volume_as_unconfirmed():
+    from optionsdesk.signals.smc import LiquidityLevel, detect_sweeps
+    df = _df_with_volume(20, sweep_vol_mult=0.5)   # volumen bajo en el sweep
+    df.iloc[-1] = {"date": "2026-01-20", "open": 110, "high": 112, "low": 104,
+                   "close": 108, "volume": 100.0}
+    level = LiquidityLevel("SSL", 105.0, "SWING_L", False, "daily")
+    sweeps = detect_sweeps(df, [level], lookback=3, volume_mult=1.5)
+    unconf = [s for s in sweeps if not s.volume_confirmed]
+    assert unconf, "sweep sin volumen en BYMA ilíquido = air-pocket, no confirmado"
+
+
+def test_smc_quality_boosts_more_for_confirmed_sweep():
+    from optionsdesk.signals.smc import SmcContext, LiquidityLevel, LiquiditySweep
+    from optionsdesk.signals.stock_signals import StockSignal, _smc_quality
+    import datetime
+    sig = StockSignal("GGAL", "SWING", "SWING_TREND_PULLBACK", datetime.datetime(2026,6,3),
+                      100, 95, 110, 60, "x")
+    lv = LiquidityLevel("SSL", 95.0, "PDL", False, "daily")
+    ctx_conf = SmcContext(sweeps=[LiquiditySweep(lv, "down", True, 10, volume_confirmed=True)])
+    ctx_unco = SmcContext(sweeps=[LiquiditySweep(lv, "down", True, 10, volume_confirmed=False)])
+    d1, _, _ = _smc_quality(sig, ctx_conf, 100)
+    d2, _, _ = _smc_quality(sig, ctx_unco, 100)
+    assert d1 > d2, "sweep con volumen debe dar más boost que sin volumen"
+
+
+# ── Tests: SmcSignal multi-TF cascade ────────────────────────────────────────
+
+class TestSmcSignal:
+    """Tests del cascade multi-timeframe que produce SmcSignal."""
+
+    def _bullish_daily(self) -> pd.DataFrame:
+        """Diario: pullback en discount + BOS_UP simulado."""
+        # Sube de 800 a 1200, luego retrocede a 960 (zona discount)
+        import math
+        n = 60
+        up   = [800 + i*13.3 for i in range(30)]
+        down = [1200 - i*8.0  for i in range(30)]
+        cl   = up + down
+        return pd.DataFrame({
+            "date":   pd.date_range("2024-01-02", periods=n, freq="B"),
+            "open":   [c*0.997 for c in cl],
+            "high":   [c*1.015 for c in cl],
+            "low":    [c*0.985 for c in cl],
+            "close":  cl,
+            "volume": [800_000 + 400_000*(i%3) for i in range(n)],
+        })
+
+    def test_smc_signal_attached_to_context(self):
+        """analyze_smc debe poblar ctx.signal con un SmcSignal."""
+        from optionsdesk.signals.smc import analyze_smc, SmcSignal
+        daily = self._bullish_daily()
+        ctx   = analyze_smc(daily, spot=float(daily["close"].iloc[-1]))
+        assert ctx.signal is not None
+        assert isinstance(ctx.signal, SmcSignal)
+
+    def test_direction_string_is_valid(self):
+        from optionsdesk.signals.smc import analyze_smc
+        daily = self._bullish_daily()
+        ctx   = analyze_smc(daily, spot=float(daily["close"].iloc[-1]))
+        assert ctx.signal.direction in ("long", "short", "neutral")
+
+    def test_quality_string_is_valid(self):
+        from optionsdesk.signals.smc import analyze_smc
+        daily = self._bullish_daily()
+        ctx   = analyze_smc(daily, spot=float(daily["close"].iloc[-1]))
+        assert ctx.signal.quality in ("S", "A", "B", "C", "none")
+
+    def _weekly_bullish(self) -> pd.DataFrame:
+        """Semanal alcista limpio para el HTF bias: el diario es un pullback dentro de esta tendencia."""
+        # 30 semanas de tendencia alcista clara: 800 → 1400
+        closes = [800 + i * 20.0 for i in range(30)]
+        return pd.DataFrame({
+            "date":   pd.date_range("2023-01-02", periods=30, freq="W"),
+            "open":   [c * 0.99 for c in closes],
+            "high":   [c * 1.02 for c in closes],
+            "low":    [c * 0.98 for c in closes],
+            "close":  closes,
+            "volume": [1_000_000] * 30,
+        })
+
+    def test_bos_up_snap_boosts_long_direction(self):
+        """Semanal alcista + BOS_UP en snap → dirección long.
+
+        El cascade exige HTF alcista primero. El diario simula un pullback dentro
+        de una tendencia mayor alcista (que refleja el semanal explícito).
+        """
+        from optionsdesk.signals.smc import analyze_smc
+
+        class FakeSnap:
+            bos = "BOS_UP"; choch = None
+
+        daily  = self._bullish_daily()
+        weekly = self._weekly_bullish()
+        ctx = analyze_smc(daily, weekly=weekly, spot=float(daily["close"].iloc[-1]), snap=FakeSnap())
+        assert ctx.signal.direction == "long", (
+            f"Con HTF alcista + BOS_UP esperaba 'long', got '{ctx.signal.direction}'. "
+            f"htf_bias={ctx.signal.htf_bias}, quality={ctx.signal.quality}"
+        )
+
+    def test_favors_short_put_in_discount_long(self):
+        """Semanal alcista + discount + BOS_UP → favors_short_put=True.
+
+        El contexto ideal para vender puts: precio en zona discount (barato),
+        tendencia macro alcista, estructura confirmada. El cascade lo detecta.
+        """
+        from optionsdesk.signals.smc import analyze_smc
+
+        class FakeSnap:
+            bos = "BOS_UP"; choch = None
+
+        daily  = self._bullish_daily()
+        weekly = self._weekly_bullish()
+        spot   = float(daily["close"].iloc[-1])   # 960 = en discount
+        ctx    = analyze_smc(daily, weekly=weekly, spot=spot, snap=FakeSnap())
+        assert ctx.signal.favors_short_put, (
+            f"Con HTF alcista + discount + BOS_UP esperaba favors_short_put=True. "
+            f"direction={ctx.signal.direction}, quality={ctx.signal.quality}, "
+            f"pda_zone={ctx.signal.pda_zone}, htf_bias={ctx.signal.htf_bias}"
+        )
+
+    def test_killzone_blocks_favors_flags(self):
+        """Durante killzone de manipulación, no debe favorecer ninguna estrategia."""
+        from optionsdesk.signals.smc import analyze_smc
+        from zoneinfo import ZoneInfo
+
+        class FakeSnap:
+            bos = "BOS_UP"; choch = None
+
+        daily = self._bullish_daily()
+        spot  = float(daily["close"].iloc[-1])
+        now_kz = datetime(2024, 1, 8, 11, 30, tzinfo=ZoneInfo("America/Argentina/Buenos_Aires"))
+        ctx    = analyze_smc(daily, spot=spot, snap=FakeSnap(), now=now_kz)
+        # Con killzone activa, ni short_put ni covered_call deben estar activos
+        assert not ctx.signal.favors_short_put,   "No debe favorecer puts en killzone apertura"
+        assert not ctx.signal.favors_covered_call, "No debe favorecer calls en killzone apertura"
+
+    def test_reason_is_non_empty_string(self):
+        from optionsdesk.signals.smc import analyze_smc
+        daily = self._bullish_daily()
+        ctx   = analyze_smc(daily, spot=float(daily["close"].iloc[-1]))
+        assert isinstance(ctx.signal.reason, str)
+        assert len(ctx.signal.reason) > 0
+
+    def test_no_exception_on_minimal_data(self):
+        """Con datos mínimos, SmcSignal debe crearse sin errores."""
+        from optionsdesk.signals.smc import analyze_smc, SmcSignal
+        daily = _make_daily(10)
+        ctx   = analyze_smc(daily, spot=float(daily["close"].iloc[-1]))
+        assert ctx.signal is not None
+
+
+class TestRsiDivergence:
+    def test_no_divergence_in_monotone_series(self):
+        from optionsdesk.signals.smc import rsi_divergence
+        n     = 50
+        daily = pd.DataFrame({
+            "date": pd.date_range("2024-01-02", periods=n, freq="B"),
+            "open": [1000.0]*n, "high": [1010.0]*n,
+            "low":  [990.0]*n,  "close": [1000.0 + i*0.1 for i in range(n)],
+            "volume": [1e6]*n,
+        })
+        result = rsi_divergence(daily)
+        assert result in ("none", "bullish", "bearish")   # no crash
+
+    def test_returns_string(self):
+        from optionsdesk.signals.smc import rsi_divergence
+        daily = _make_wavy(60)
+        result = rsi_divergence(daily)
+        assert isinstance(result, str)
+        assert result in ("bullish", "bearish", "none")
+
+    def test_empty_returns_none(self):
+        from optionsdesk.signals.smc import rsi_divergence
+        result = rsi_divergence(pd.DataFrame())
+        assert result == "none"
+
+    def test_insufficient_data_returns_none(self):
+        from optionsdesk.signals.smc import rsi_divergence
+        daily = _make_daily(10)
+        result = rsi_divergence(daily, length=14, lookback=12)
+        assert result == "none"   # necesita length+lookback = 26 barras mínimo

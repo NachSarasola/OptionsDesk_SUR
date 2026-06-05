@@ -27,6 +27,18 @@ _MIN_NET_RR = 0.4
 # (regla Minervini: comprar cerca del pivote, no arriba del envión).
 _MAX_BREAKOUT_EXTENSION = 0.05
 
+
+def _learned(name: str, default: float) -> float:
+    """Lee un parametro aprendido por el learner; default si no hay (==hoy).
+
+    Import perezoso + degradacion silenciosa al valor de fabrica ante cualquier fallo.
+    """
+    try:
+        from optionsdesk.backtest.param_store import param
+        return param(name, default)
+    except Exception:
+        return default
+
 # ── Protección BYMA: parámetros de liquidez (overrideables por settings) ──────
 from optionsdesk.config.settings import settings
 # Spread bid/ask máximo como % del mid. Spreads mayores implican slippage real
@@ -58,6 +70,10 @@ class StockSignal:
     smc_structure: Optional[str] = None      # "BOS_UP" | "BOS_DOWN" | None
     nearest_liquidity: Optional[str] = None  # descripción del nivel más cercano
     adr_confluence: Optional[str] = None     # "confirmed" | "fx_driven" | "unknown"
+    # Market intel externo (Fase 2 — analistas Yahoo + social StockTwits)
+    analyst_note: Optional[str] = None       # ej. "Compra +12% (8 analistas)"
+    social_note: Optional[str] = None        # ej. "68%🐂 45msg"
+    intel_delta: float = 0.0                  # boost/penalización aplicado al score
 
     @property
     def risk_per_share(self) -> float:
@@ -87,6 +103,25 @@ def signal_grade(score: float) -> str:
     if score >= 52:
         return "C"
     return "D"
+
+
+def signal_edge_status(
+    signal: "StockSignal",
+    blocked_setups: set[str],
+    blocked_grades: set[str],
+) -> str:
+    """Veredicto de edge realizado: '' si la señal es operable, motivo si es basura.
+
+    Fuente única consultada por el demo (no abrir) y el panel (marcar/ocultar): una
+    señal se descarta si su setup O su grade ya probaron edge negativo con muestra
+    suficiente. Las señales nuevas (sin historial) siempre quedan operables.
+    """
+    setup_key = f"STOCK_{str(signal.signal_type).upper()}"
+    if setup_key in blocked_setups:
+        return "setup sin edge histórico"
+    if signal_grade(signal.score) in blocked_grades:
+        return "grade sin edge histórico"
+    return ""
 
 
 def scan_stock_symbol(
@@ -129,26 +164,61 @@ def scan_stock_symbol(
     smc_enrichment = _build_smc_enrichment(symbol, quote, daily, weekly)
     smc_ctx = _smc_context_safe(daily, weekly, spot)
 
+    # Volumen: calcular snapshot una vez, aplicar a todas las señales del símbolo.
+    # Solo daily (tape intradía volume=0 en BYMA). Si falla, degradar silenciosamente.
+    vol_delta = 0.0
+    vol_notes: list[str] = []
+    vol_note_str = ""
+    try:
+        from optionsdesk.signals.volume_momentum import volume_snapshot, volume_score_delta
+        rvol_lookback = int(_learned("rvol_lookback", 20))
+        vol_snap = volume_snapshot(
+            _normalize_daily(daily),
+            lookback=rvol_lookback,
+        ) if daily is not None else None
+        if vol_snap is not None:
+            vol_delta, vol_notes = volume_score_delta(vol_snap)
+            vol_note_str = " | Vol: " + " · ".join(vol_notes) if vol_notes else ""
+    except Exception:
+        pass
+
     # Setup SMC_REVERSAL: el de mayor calidad, detectado antes que los AT clásicos.
     smcrev_signals = _scan_smc_reversal(symbol.upper(), quote, daily, weekly, current, smc_ctx)
 
     out: list[StockSignal] = []
+    intel_d = float(smc_enrichment.get("intel_delta", 0.0)) if smc_enrichment else 0.0
 
-    # Procesar señales SMC_REVERSAL (ya tienen calidad garantizada)
-    for sig in smcrev_signals:
-        priced = _apply_costs(sig, costs)
-        if priced.net_rr < _MIN_NET_RR * 0.8:   # umbral más bajo: el setup es de alta calidad
-            continue
+    def _apply_intel_and_vol(sig: StockSignal) -> StockSignal:
+        """Aplica intel_delta y vol_delta al score, fusiona enrichment SMC."""
         if smc_enrichment:
-            priced = replace(priced, **smc_enrichment)
-        out.append(priced)
+            sig = replace(sig, **{k: v for k, v in smc_enrichment.items() if k != "intel_delta"})
+        total_boost = intel_d + vol_delta
+        if total_boost:
+            new_score = round(min(max(sig.score + total_boost, 0.0), 100.0), 1)
+            sig = replace(sig, score=new_score)
+        if vol_note_str:
+            sig = replace(sig, rationale=sig.rationale + vol_note_str)
+        return sig
+
+    min_net_rr = _learned("stock_min_net_rr", _MIN_NET_RR)
+
+    # Procesar señales SMC_REVERSAL (ya tienen calidad garantizada). El tree-search
+    # puede apagar este setup completo via flag enable_smc_reversal.
+    if _setup_enabled("SMC_REVERSAL"):
+        for sig in smcrev_signals:
+            priced = _apply_costs(sig, costs)
+            if priced.net_rr < min_net_rr * 0.8:   # umbral más bajo: el setup es de alta calidad
+                continue
+            out.append(_apply_intel_and_vol(priced))
 
     # Setups AT clásicos filtrados y mejorados por SMC
     for sig in _scan_swings(symbol.upper(), quote, daily, weekly, current):
+        if not _setup_enabled(sig.signal_type):
+            continue
         if sig.risk_per_share <= 0 or sig.rr < 1.2:
             continue
         priced = _apply_costs(sig, costs)
-        if priced.net_rr < _MIN_NET_RR:
+        if priced.net_rr < min_net_rr:
             continue
         if smc_ctx is not None:
             delta, block, notes = _smc_quality(priced, smc_ctx, spot)
@@ -160,11 +230,30 @@ def scan_stock_symbol(
                     score=round(min(max(priced.score + delta, 0.0), 100.0), 1),
                     rationale=priced.rationale + (f" | SMC: {', '.join(notes)}" if notes else ""),
                 )
-        if smc_enrichment:
-            priced = replace(priced, **smc_enrichment)
-        out.append(priced)
+        out.append(_apply_intel_and_vol(priced))
 
     return sorted(out, key=lambda s: (s.score, s.net_rr), reverse=True)
+
+
+# Mapeo signal_type → flag de param_store. El tree-search descubre QUE combinacion
+# de setups rinde mejor encendiendo/apagando cada uno.
+_SETUP_FLAG = {
+    "SMC_REVERSAL": "enable_smc_reversal",
+    "SWING_TREND_PULLBACK": "enable_swing_pullback",
+    "SWING_BREAKOUT": "enable_swing_breakout",
+}
+
+
+def _setup_enabled(signal_type: str) -> bool:
+    """True si el setup esta activo (default True → comportamiento de hoy)."""
+    flag_name = _SETUP_FLAG.get(str(signal_type).upper())
+    if flag_name is None:
+        return True
+    try:
+        from optionsdesk.backtest.param_store import flag
+        return flag(flag_name, True)
+    except Exception:
+        return True
 
 
 def _scan_smc_reversal(
@@ -191,10 +280,14 @@ def _scan_smc_reversal(
         return []
 
     sweeps = getattr(smc_ctx, "sweeps", [])
+    # Sniper entry requiere sweep con VOLUMEN CONFIRMADO: en BYMA ilíquido un "barrido"
+    # sin volumen es un air-pocket de book vacío, no un movimiento institucional.
+    # Solo usamos los sweeps de volumen alto para el setup de más calidad.
     ssl_reversals = [
         sw for sw in sweeps
         if getattr(sw, "direction", "") == "down"
         and getattr(sw, "reversed", False)
+        and getattr(sw, "volume_confirmed", False)
     ]
     if not ssl_reversals:
         return []
@@ -344,6 +437,25 @@ def _build_smc_enrichment(
                 conf   = _adr_confluence(_bos_to_dir(bos), adr_df)
                 enrichment["adr_confluence"] = conf
 
+        # Market Intel externo: analistas Yahoo + social StockTwits.
+        # Confluencia SECUNDARIA: la SMC manda, el intel confirma. Cap ±10 pts.
+        try:
+            from optionsdesk.data.providers.market_intel import fetch_market_intel
+            intel = fetch_market_intel(symbol)
+            if intel is not None:
+                d = intel.score_delta()
+                enrichment["intel_delta"] = d
+                if intel.analyst_label:
+                    up_str = f" {intel.target_upside_pct:+.0f}%" if intel.target_upside_pct is not None else ""
+                    n_str  = f" ({intel.n_analysts} an.)" if intel.n_analysts else ""
+                    enrichment["analyst_note"] = f"{intel.analyst_label}{up_str}{n_str}"
+                if intel.social_msgs_24h:
+                    bull_str = f" {intel.social_bull_pct:.0f}%🐂" if intel.social_bull_pct else ""
+                    enrichment["social_note"] = f"{intel.social_msgs_24h}msg{bull_str}"
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("market_intel(%s) fallo: %s", symbol, exc)
+
         return enrichment
     except Exception as exc:
         import logging
@@ -386,13 +498,25 @@ def _smc_quality(sig: StockSignal, ctx, spot: float) -> tuple[float, Optional[st
     if mm is not None and getattr(mm, "stack", "") == "bearish":
         return 0.0, "ciclo MM bajista (no comprar contra la corriente)", []
 
-    # Gate suave ADR/CCL: si el movimiento local es solo dólar, penalizar score.
-    # No bloqueamos del todo (podría haber momentum genuino), pero bajamos -15 pts
-    # para que solo setups de muy alta calidad SMC puedan superar el filtro.
+    # Gate ADR/CCL anti-espejismo:
+    # BREAKOUT fx_driven = el breakout en pesos es el dólar subiendo, no el activo.
+    #   → Bloqueo DURO: comprar un espejismo CCL es el peor error en MERVAL.
+    # PULLBACK fx_driven = puede tener momentum genuino (desfase horario NYSE).
+    #   → Penalización suave -15 pts (solo pasa setups de calidad alta).
+    # Configurable con ADR_CCL_HARD_BLOCK_BREAKOUT (default True).
     adr_conf = getattr(sig, "adr_confluence", None)
     if adr_conf == "fx_driven":
+        if is_breakout:
+            try:
+                from optionsdesk.config.settings import settings as _s
+                hard = getattr(_s, "adr_ccl_hard_block_breakout", True)
+            except Exception:
+                hard = True
+            if hard:
+                return 0.0, "espejismo CCL: breakout en pesos sin movimiento real del ADR", []
+        # pullback o reversal: penalizar suave
         delta -= 15.0
-        notes.append("movimiento impulsado por CCL, no por el activo (-15 pts)")
+        notes.append("movimiento parcialmente impulsado por CCL (-15 pts)")
 
     # PDA premium/discount: clave para el PULLBACK (comprar value, no el techo).
     pda = getattr(ctx, "pda", None)
@@ -408,12 +532,25 @@ def _smc_quality(sig: StockSignal, ctx, spot: float) -> tuple[float, Optional[st
         if ote.lo <= spot <= ote.hi:
             delta += 10.0; notes.append("entrada en OTE 0.618–0.786")
 
-    # Barrido SSL + reversión reciente (stop hunt alcista) — entrada de alta calidad.
-    if any(
-        getattr(sw, "direction", "") == "down" and getattr(sw, "reversed", False)
-        for sw in (getattr(ctx, "sweeps", None) or [])
-    ):
-        delta += 8.0; notes.append("barrido SSL + reversión (stop hunt)")
+    # Barrido SSL + reversión con VOLUMEN confirmado = stop hunt institucional real.
+    # En BYMA ilíquido un sweep sin volumen es air-pocket, no institucional.
+    # Solo sube el score si el sweep estuvo acompañado de volumen real.
+    vol_sweeps = [
+        sw for sw in (getattr(ctx, "sweeps", None) or [])
+        if getattr(sw, "direction", "") == "down"
+        and getattr(sw, "reversed", False)
+        and getattr(sw, "volume_confirmed", False)
+    ]
+    unconfirmed_sweeps = [
+        sw for sw in (getattr(ctx, "sweeps", None) or [])
+        if getattr(sw, "direction", "") == "down"
+        and getattr(sw, "reversed", False)
+        and not getattr(sw, "volume_confirmed", False)
+    ]
+    if vol_sweeps:
+        delta += 8.0; notes.append("barrido SSL + volumen confirmado (stop hunt real)")
+    elif unconfirmed_sweeps:
+        delta += 3.0; notes.append("barrido SSL sin volumen (posible air-pocket, +3)")
 
     liquidity = getattr(ctx, "liquidity", None) or []
     if is_breakout:
@@ -524,7 +661,9 @@ def _scan_swings(
         and sma20 > sma50
         and entry > sma50
     )
-    not_extended = entry <= prior_high * (1.0 + _MAX_BREAKOUT_EXTENSION)
+    not_extended = entry <= prior_high * (
+        1.0 + _learned("stock_max_breakout_extension", _MAX_BREAKOUT_EXTENSION)
+    )
     if (
         weekly_up
         and trend_template_ok

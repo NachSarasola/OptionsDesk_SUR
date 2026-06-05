@@ -144,16 +144,17 @@ def run_stock_demo_tick(
     closed_symbols: set[str] = _recently_closed_symbols(trade_file, current, cooldown_s=60.0)
     opened = 0
 
-    # Gate anti-basura: no abrir setups que YA demostraron edge negativo con muestra
-    # suficiente. Los setups nuevos (pocos trades) nunca se bloquean. Lee el mismo
-    # directorio de datos del demo para ser determinístico.
+    # Gate anti-basura: no abrir setups NI grades que YA demostraron edge negativo con
+    # muestra suficiente. Las señales nuevas nunca se bloquean. Lee el mismo directorio
+    # de datos del demo para ser determinístico.
     blocked_setups: set[str] = set()
+    blocked_grades: set[str] = set()
     if block_junk:
         try:
-            from optionsdesk.performance.attribution import blocked_strategies
-            blocked_setups = blocked_strategies(trade_file.parent)
+            from optionsdesk.performance.attribution import block_lists
+            blocked_setups, blocked_grades = block_lists(trade_file.parent)
         except Exception:
-            blocked_setups = set()
+            blocked_setups, blocked_grades = set(), set()
 
     survivors: list[StockDemoPosition] = []
     for position in positions:
@@ -186,21 +187,10 @@ def run_stock_demo_tick(
     open_scalps = sum(1 for p in positions if p.strategy == "SCALP")
     open_swings = sum(1 for p in positions if p.strategy == "SWING")
 
-    # ── Circuit breaker: no abrir nuevas posiciones si el sistema está halted ──
+    # ── Circuit breaker (ignorado en DEMO para que siga aprendiendo) ──
     if adaptive_context is not None and getattr(adaptive_context, "halted", False):
-        _count(skipped, "circuit_breaker_halted")
-        save_stock_demo_positions(positions, pos_file)
-        if new_trades:
-            append_stock_demo_trades(new_trades, trade_file)
-        all_trades = load_stock_demo_trades(trade_file, limit=1_000)
-        return StockDemoResult(
-            positions=positions,
-            closed_trades=all_trades,
-            skipped_reasons={"circuit_breaker_halted": 1},
-            opened_count=0,
-            closed_count=len(new_trades),
-        )
-
+        _count(skipped, "circuit_breaker_active_but_ignored")
+        # No bloqueamos el demo, queremos que siga tradeando para generar historial
     for signal in sorted(signals, key=lambda s: (s.score, s.rr), reverse=True):
         symbol = signal.symbol.upper()
         if symbol in open_symbols:
@@ -215,9 +205,11 @@ def run_stock_demo_tick(
         if signal.strategy == "SWING" and open_swings >= swing_limit:
             _count(skipped, "max_swings")
             continue
-        if f"STOCK_{str(signal.signal_type).upper()}" in blocked_setups:
-            _count(skipped, "sin_edge_realizado")
-            continue
+        if block_junk:
+            from optionsdesk.signals.stock_signals import signal_edge_status
+            if signal_edge_status(signal, blocked_setups, blocked_grades):
+                _count(skipped, "sin_edge_realizado")
+                continue
         # Score mínimo adaptativo: en modo DEFENSIVE solo entran setups de alta calidad
         if adaptive_context is not None:
             min_score = getattr(adaptive_context, "min_score_for_entry", 65.0)
@@ -225,8 +217,15 @@ def run_stock_demo_tick(
                 _count(skipped, f"score_bajo_{adaptive_context.mode.lower()}")
                 continue
         quote = qmap.get(symbol)
-        if quote is None or not _book_enterable(quote):
-            _count(skipped, "sin_ask_para_entrar")
+        if quote is None:
+            _count(skipped, "sin_quote")
+            continue
+        if not (quote.ask > 0 and quote.bid > 0 and quote.ask > quote.bid):
+            _count(skipped, "sin_book_valido")
+            continue
+        mid = (quote.ask + quote.bid) / 2.0
+        if mid > 0 and ((quote.ask - quote.bid) / mid * 100.0) > _MAX_SPREAD_PCT_DEMO:
+            _count(skipped, "spread_muy_alto")
             continue
         if _quote_age_s(quote, current) > max_age:
             _count(skipped, "quote_stale_entrada")

@@ -1266,6 +1266,37 @@ def _render_smc_panel(smc_ctx: object) -> None:
         killzone  = getattr(smc_ctx, "killzone", None)
         ote       = getattr(smc_ctx, "ote", None)
         adr_conf  = getattr(smc_ctx, "adr_confluence", None)
+        sig       = getattr(smc_ctx, "signal", None)
+
+        # ── SmcSignal — señal de trading directa ─────────────────────────────
+        if sig is not None:
+            _Q_FN = {"S": st.success, "A": st.success, "B": st.info,
+                     "C": st.warning, "none": st.info}
+            _Q_LABELS = {"S": "SNIPER (S)", "A": "Fuerte (A)", "B": "Moderada (B)",
+                         "C": "Marginal (C)", "none": "Sin señal"}
+            quality = getattr(sig, "quality", "none")
+            direction = getattr(sig, "direction", "neutral")
+            reason = getattr(sig, "reason", "")
+
+            fn_use = _Q_FN.get(quality, st.info)
+            fn_use(
+                f"Calidad **{_Q_LABELS.get(quality, quality)}** — "
+                f"Dirección **{direction.upper()}**  ·  {reason}"
+            )
+
+            _sig_cols = st.columns(3)
+            entry_lbl = getattr(sig, "entry_label", "")
+            target_lbl = getattr(sig, "target_label", "")
+            stop_lbl  = getattr(sig, "stop_label", "")
+            if entry_lbl:  _sig_cols[0].caption(f"Entry: {entry_lbl}")
+            if target_lbl: _sig_cols[1].caption(f"Target: {target_lbl}")
+            if stop_lbl:   _sig_cols[2].caption(f"Stop: {stop_lbl}")
+
+            _opts = st.columns(3)
+            _opts[0].metric("Short Put", "SI" if getattr(sig, "favors_short_put", False) else "NO")
+            _opts[1].metric("Call Cubierto", "SI" if getattr(sig, "favors_covered_call", False) else "NO")
+            _opts[2].metric("Esperar", "SI" if getattr(sig, "favors_wait", True) else "NO")
+            st.divider()
 
         # Fila 1: zona PDA + killzone + ADR
         pcols = st.columns([2, 1, 1])
@@ -1733,6 +1764,16 @@ def _tab_stocks(provider: MarketDataProvider, provider_health: MarketDataHealth,
     append_stock_quotes(quotes.values(), now=now, min_interval_s=10.0)
     tape_df = load_stock_tape(symbols=symbols, now=now)
 
+    # Edge realizado: qué setups/grades ya probaron perder (no mostrar como operables).
+    blocked_setups: set = set()
+    blocked_grades: set = set()
+    try:
+        from optionsdesk.performance.attribution import block_lists
+        blocked_setups, blocked_grades = block_lists(settings.stock_demo_trades_file.parent)
+    except Exception:
+        pass
+    from optionsdesk.signals.stock_signals import signal_grade, signal_edge_status
+
     # Scan and generate signals
     all_signals = []
     table_rows = []
@@ -1804,23 +1845,84 @@ def _tab_stocks(provider: MarketDataProvider, provider_health: MarketDataHealth,
                 smc_col_parts.append(near_lv[:16])
         smc_col = " | ".join(smc_col_parts) if smc_col_parts else "-"
 
+        # Volumen: RVOL + OBV del día — detecta la ola temprano en BYMA.
+        # `daily` ya está disponible del scan anterior — no re-descargamos.
+        vol_col = "-"
+        try:
+            from optionsdesk.signals.volume_momentum import volume_snapshot as _vs
+            _snp = _vs(daily) if daily is not None else None
+            if _snp is not None and _snp.rvol is not None:
+                _icons = {"explosivo": "🔥", "alto": "⬆", "normal": "—", "bajo": "⬇"}
+                _icon = _icons.get(_snp.rvol_label, "")
+                vol_col = f"{_icon}{_snp.rvol:.1f}x"
+                if _snp.obv_divergence == "acumulacion_silenciosa":
+                    vol_col += " ⚡"
+                elif _snp.obv_divergence == "distribucion":
+                    vol_col += " ⚠"
+        except Exception:
+            pass
+
+        # Grade + veredicto de edge realizado (no mostrar basura como operable).
+        edge_flag = ""
+        grade_col = "-"
+        intel_col = "-"
+        if best is not None:
+            grade_col = signal_grade(best.score)
+            status = signal_edge_status(best, blocked_setups, blocked_grades)
+            if status:
+                edge_flag = f"  ⚠ {status}"
+            # Columna Intel: analistas + social
+            analyst = getattr(best, "analyst_note", None)
+            social  = getattr(best, "social_note", None)
+            parts   = [p for p in [analyst, social] if p]
+            intel_col = " · ".join(parts) if parts else "-"
+
         table_rows.append({
             "Símbolo": symbol,
             "Precio": _scalp_money(quote.mid or quote.last, 2),
             "Spread": _scalp_pct(quote.spread_pct, 2),
             "Señal": best.strategy if best else "RADAR",
             "Setup": best.signal_type if best else "-",
+            "Grade": grade_col,
             "Score": best.score if best else "-",
+            "Vol": vol_col,
             "Stop": _scalp_money(best.stop_price, 2) if best else "-",
             "TP": _scalp_money(best.target_price, 2) if best else "-",
+            "Intel": intel_col,
             "SMC": smc_col,
             "Frescura": _stock_age_label(age_s),
-            "Motivo": best.rationale if best else blocker,
+            "Motivo": (best.rationale + edge_flag) if best else blocker,
         })
+
+    # Regime diario: ¿risk-on, cauteloso o risk-off?
+    regime = None
+    try:
+        from optionsdesk.signals.regime import compute_daily_regime
+        regime = compute_daily_regime(symbols)
+    except Exception:
+        pass
 
     # Run the demo engine tick (focus strictly on swings, disable scalping)
     swing_signals = [s for s in all_signals if s.strategy == "SWING"]
+    # El regime filtra señales de baja calidad en días de espejismo macro.
+    if regime is not None and regime.min_grade_override:
+        from optionsdesk.signals.stock_signals import signal_grade as _sg
+        _grade_order = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4}
+        _min = _grade_order.get(regime.min_grade_override, 99)
+        swing_signals = [
+            s for s in swing_signals
+            if _grade_order.get(_sg(s.score), 99) <= _min
+        ]
     demo = run_stock_demo_tick(quotes, swing_signals, max_scalps=0, now=now, adaptive_context=adaptive_context)
+    
+    try:
+        from optionsdesk.backtest.genetic import EvolutionEngine
+        if "genetic_engine" not in st.session_state:
+            st.session_state.genetic_engine = EvolutionEngine(population_size=20)
+        st.session_state.genetic_engine.step(all_signals, quotes)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error in genetic step: {e}")
     
     # Calculate open positions P&L
     open_positions_df = positions_frame(demo.positions, quotes)
@@ -1846,9 +1948,33 @@ def _tab_stocks(provider: MarketDataProvider, provider_health: MarketDataHealth,
         kelly_label = " | Sizing: 5.0% (static)"
 
     interval_label = f"{settings.stock_demo_refresh_interval_s}s"
+    # Regime del día en el header
+    if regime is not None:
+        _r_icons = {"risk-on": "🟢", "cauteloso": "🟡", "risk-off": "🔴"}
+        _r_icon = _r_icons.get(regime.label, "⚪")
+        st.caption(
+            f"{_r_icon} Regime {regime.label.upper()}: {regime.summary}"
+        )
     st.caption(
         f"Refresh {interval_label} | guardado tape en {settings.stock_tape_dir}{kelly_label}"
     )
+
+    # Indicador de suficiencia del adaptativo: hace honesto "el motor está ciego"
+    # hasta acumular suficiente historial real de swings.
+    try:
+        from optionsdesk.performance.attribution import load_all_closed_trades
+        _n_swings = sum(1 for t in load_all_closed_trades() if t.realized_pnl_ars is not None)
+        _min_s = 15
+        if _n_swings < _min_s:
+            st.warning(
+                f"Adaptive: {_n_swings}/{_min_s} trades cerrados. Motor aprendiendo — "
+                "sizing y filtros son conservadores hasta tener historial suficiente. "
+                "No aumentar capital real hasta llegar al umbral."
+            )
+        elif _n_swings < 40:
+            st.info(f"Adaptive: {_n_swings} trades. Motor entrenando — resultados aún preliminares.")
+    except Exception:
+        pass
 
     if demo.skipped_reasons:
         top = sorted(demo.skipped_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
@@ -1885,8 +2011,8 @@ def _tab_stocks(provider: MarketDataProvider, provider_health: MarketDataHealth,
             st.success(
                 f"**{badge_txt}** — {top['Símbolo']} | "
                 f"{top.get('Grade','')} Score {top.get('Score','-')} | "
-                f"Entrada \\${top.get('Precio','-')} | "
-                f"Stop \\${top.get('Stop','-')} | TP \\${top.get('TP','-')} | "
+                f"Entrada {top.get('Precio','-')} | "
+                f"Stop {top.get('Stop','-')} | TP {top.get('TP','-')} | "
                 f"{top.get('Motivo','')[:80]}"
             )
 
@@ -2564,54 +2690,109 @@ def _render_market_state_bar(context, spot: float) -> None:
     # ADR
     adr_conf = getattr(smc, "adr_confluence", None) if smc is not None else None
 
-    # ── Señal resumida ──────────────────────────────────────────────────────────
-    # La señal es la respuesta a "¿qué hago con las opciones de GGAL ahora?"
-    if trend in ("alcista", "ALCISTA") and pda_zone == "discount":
-        rec_signal = "VENDER PUT — zona discount + tendencia alcista"
-        rec_fn     = st.success
-    elif trend in ("bajista", "BAJISTA") and pda_zone == "premium":
-        rec_signal = "LANZAR CALL CUBIERTO — zona premium + tendencia bajista"
-        rec_fn     = st.error
-    elif trend in ("alcista", "ALCISTA") and pda_zone == "premium":
-        rec_signal = "ESPERAR retroceso a zona discount antes de vender put"
-        rec_fn     = st.warning
-    elif trend in ("bajista", "BAJISTA") and pda_zone == "discount":
-        rec_signal = "ESPERAR confirmacion — tendencia baja pero zona discount"
-        rec_fn     = st.warning
-    elif killzone == "manipulacion":
-        rec_signal = "KILLZONE APERTURA — esperar el movimiento real (11–12h)"
-        rec_fn     = st.warning
+    # ── SmcSignal — respuesta directa del cascade multi-TF ────────────────────
+    smc_sig = getattr(smc, "signal", None) if smc is not None else None
+
+    if smc_sig is not None:
+        direction    = getattr(smc_sig, "direction", "neutral")
+        quality      = getattr(smc_sig, "quality", "none")
+        favors_sp    = getattr(smc_sig, "favors_short_put", False)
+        favors_cc    = getattr(smc_sig, "favors_covered_call", False)
+        favors_wait  = getattr(smc_sig, "favors_wait", True)
+        sig_reason   = getattr(smc_sig, "reason", "")
+        sig_target   = getattr(smc_sig, "target", 0.0)
+        sig_stop     = getattr(smc_sig, "stop", 0.0)
+        target_lbl   = getattr(smc_sig, "target_label", "")
+        stop_lbl     = getattr(smc_sig, "stop_label", "")
+
+        _Q_ICON = {"S": "🟣S", "A": "🟢A", "B": "🟡B", "C": "🟠C", "none": "⚪—"}
+        q_badge = _Q_ICON.get(quality, "⚪—")
+
+        if favors_sp and not killzone:
+            action_txt = f"VENDER PUT GGAL — calidad {q_badge}"
+            if sig_target > 0:
+                action_txt += f"  ·  target ${sig_target:,.0f} ({target_lbl.split('$')[0].strip()})"
+            if sig_stop > 0:
+                action_txt += f"  ·  stop ${sig_stop:,.0f}"
+            rec_fn = st.success if quality in ("S", "A") else st.info
+        elif favors_cc and not killzone:
+            action_txt = f"LANZAR CALL CUBIERTO GGAL — calidad {q_badge}"
+            if sig_target > 0:
+                action_txt += f"  ·  target ${sig_target:,.0f}"
+            rec_fn = st.error if quality in ("S", "A") else st.warning
+        elif killzone == "manipulacion":
+            action_txt = f"KILLZONE APERTURA (11-12h) — esperar desarrollo  ·  {q_badge}"
+            rec_fn = st.warning
+        elif killzone == "distribucion":
+            if favors_sp or direction == "long":
+                action_txt = "CIERRE (15:30-17h) — si hay posición abierta, es buen momento para TP"
+            else:
+                action_txt = "Killzone distribución — movimientos de cierre de ALyCs"
+            rec_fn = st.warning
+        else:
+            action_txt = f"ESPERAR — calidad {q_badge}  ·  sin confluencia suficiente para actuar"
+            rec_fn = st.info
+
+        if sig_reason and "killzone" not in sig_reason.lower():
+            action_txt += f"  ·  {sig_reason[:80]}"
+        if adr_conf == "fx_driven":
+            action_txt = "⚠ MOVIDO POR DOLAR (CCL)  ·  " + action_txt
+            rec_fn = st.warning
+
+        rec_fn(action_txt)
     else:
-        rec_signal = "Sin señal clara — esperar confluencia"
-        rec_fn     = st.info
-
-    if sweep_signal:
-        rec_signal = f"{rec_signal}  ·  {sweep_signal}"
-    if adr_conf == "fx_driven":
-        rec_signal = f"ALERTA CCL: movimiento por dólar, no por activo  ·  {rec_signal}"
-        rec_fn = st.warning
-
-    rec_fn(rec_signal)
+        # Fallback sin SmcSignal: señal simple por tendencia y zona PDA
+        if trend in ("alcista", "ALCISTA") and pda_zone == "discount":
+            rec_fn, rec_signal = st.success, "VENDER PUT — zona discount + tendencia alcista"
+        elif trend in ("bajista", "BAJISTA") and pda_zone == "premium":
+            rec_fn, rec_signal = st.error, "LANZAR CALL CUBIERTO — zona premium + bajista"
+        elif killzone == "manipulacion":
+            rec_fn, rec_signal = st.warning, "KILLZONE APERTURA — esperar 12h"
+        else:
+            rec_fn, rec_signal = st.info, "Sin señal clara — esperar confluencia"
+        if sweep_signal:
+            rec_signal += f"  ·  {sweep_signal}"
+        if adr_conf == "fx_driven":
+            rec_signal = "ALERTA CCL  ·  " + rec_signal
+            rec_fn = st.warning
+        rec_fn(rec_signal)
 
     # ── Métricas en una fila ────────────────────────────────────────────────────
-    cols = st.columns(5)
-    _TREND_ICON  = {"alcista": "📈", "bajista": "📉", "lateral": "↔"}.get(trend.lower(), "")
-    _ZONE_ICON   = {"discount": "▲ DISCOUNT", "premium": "▼ PREMIUM",
-                    "equilibrium": "= EQUILIBRIO"}.get(pda_zone or "", "— sin datos")
-    _KZ_MAP      = {"manipulacion": "⚠ APERTURA 11-12h", "distribucion": "⏰ CIERRE 15:30-17h"}
-    _ADR_MAP     = {"confirmed": "✓ ADR OK", "fx_driven": "⚠ CCL", "unknown": "— ADR"}
+    cols = st.columns(6)
+    _TREND_ICON = {"alcista": "📈", "bajista": "📉", "lateral": "↔"}.get(trend.lower(), "")
+    _ZONE_ICON  = {"discount": "▲ DISCOUNT", "premium": "▼ PREMIUM",
+                   "equilibrium": "= EQUILIBRIO"}.get(pda_zone or "", "— sin datos")
+    _KZ_MAP     = {"manipulacion": "⚠ APERTURA 11-12h", "distribucion": "⏰ CIERRE 15:30-17h"}
+    _ADR_MAP    = {"confirmed": "✓ ADR OK", "fx_driven": "⚠ CCL", "unknown": "— ADR"}
+
+    smc_sig_q = "—"
+    smc_sig_dir = "—"
+    if smc_sig is not None:
+        _Q_LABELS = {"S": "🟣S (sniper)", "A": "🟢A (fuerte)", "B": "🟡B (ok)",
+                     "C": "🟠C (débil)", "none": "⚪ esperar"}
+        smc_sig_q   = _Q_LABELS.get(getattr(smc_sig, "quality", "none"), "—")
+        smc_sig_dir = getattr(smc_sig, "direction", "neutral").capitalize()
 
     cols[0].metric("Tendencia",  f"{_TREND_ICON} {trend.capitalize()} ({conf})")
     cols[1].metric("Zona PDA",   _ZONE_ICON)
-    cols[2].metric("Momentum",   f"{mom:+.1f}%")
-    cols[3].metric("Killzone",   _KZ_MAP.get(killzone or "", "— Fuera de KZ"))
-    cols[4].metric("ADR/CCL",    _ADR_MAP.get(adr_conf or "", "— sin datos"))
+    cols[2].metric("Calidad SMC", smc_sig_q)
+    cols[3].metric("Momentum",   f"{mom:+.1f}%")
+    cols[4].metric("Killzone",   _KZ_MAP.get(killzone or "", "Fuera de KZ"))
+    cols[5].metric("ADR/CCL",    _ADR_MAP.get(adr_conf or "", "— sin datos"))
 
     if eq_price and spot > 0:
         dist_pct = (spot - eq_price) / eq_price * 100.0
+        rsi_txt  = ""
+        obv_txt  = ""
+        if smc_sig is not None:
+            rsi_div_v = getattr(smc_sig, "rsi_div", "none")
+            if rsi_div_v != "none":
+                rsi_txt = f"  ·  RSI div {rsi_div_v}"
+            if getattr(smc_sig, "obv_alcista", False):
+                obv_txt = "  ·  OBV acumulando"
         st.caption(
             f"Spot ${spot:,.0f}  ·  Equilibrio PDA ${eq_price:,.0f}  "
-            f"({'arriba' if dist_pct > 0 else 'abajo'} {abs(dist_pct):.1f}% del equilibrio)"
+            f"({'arriba' if dist_pct > 0 else 'abajo'} {abs(dist_pct):.1f}%){rsi_txt}{obv_txt}"
         )
     st.divider()
 
@@ -2770,6 +2951,178 @@ def _positions_iol_rows() -> list[dict]:
         return []
 
 
+# ── Analizador intertemporal de posiciones ────────────────────────────────────
+
+_ACTION_COLOR = {
+    "CLOSE_NOW": "error",
+    "ROLL":      "warning",
+    "DEFEND":    "warning",
+    "ROTATE":    "warning",
+    "PARTIAL":   "info",
+    "HOLD":      "success",
+}
+_ACTION_ICON = {
+    "CLOSE_NOW": "🔴",
+    "ROLL":      "🔄",
+    "DEFEND":    "🛡",
+    "ROTATE":    "🔃",
+    "PARTIAL":   "🟡",
+    "HOLD":      "🟢",
+}
+
+
+def _render_advice_card(adv, chain: Optional[OptionsChain]) -> None:
+    """Tarjeta de consejo intertemporal para una posicion abierta."""
+    icon = _ACTION_ICON.get(adv.action, "⚪")
+    color_fn = {"error": st.error, "warning": st.warning,
+                "success": st.success, "info": st.info}[
+        _ACTION_COLOR.get(adv.action, "info")
+    ]
+    with st.container(border=True):
+        # Fila de métricas
+        h = st.columns([3.5, 1, 1, 1, 1])
+        h[0].markdown(
+            f"**{icon} {adv.position.symbol}** — "
+            f"{adv.position.strategy.replace('_', ' ').title()}"
+        )
+        h[1].metric("Captura", f"{adv.capture_pct:.0f}%")
+        h[2].metric("DTE", str(adv.dte))
+        h[3].metric("Delta", f"{adv.current_delta:.2f}" if adv.current_delta is not None else "—")
+        urgency_badge = {"alta": "🔴 Alta", "media": "🟡 Media", "baja": "🟢 Baja"}
+        h[4].metric("Urgencia", urgency_badge.get(adv.urgency, adv.urgency))
+
+        # Headline accionable
+        color_fn(adv.headline)
+        st.caption(adv.reason)
+
+        # Flags de riesgo
+        for flag in adv.risk_flags:
+            st.caption(f"Riesgo: {flag}")
+
+        # Trayectoria temporal
+        if adv.scenarios:
+            with st.expander("Trayectoria (theta decay — spot congelado)"):
+                sc_rows = []
+                for sc in adv.scenarios:
+                    sc_rows.append({
+                        "En": f"+{sc.days_from_now}d",
+                        "DTE rest.": sc.dte_remaining,
+                        "Captura": f"{sc.capture_pct:.0f}%",
+                        "P&L ($)": f"${sc.pnl_ars:,.0f}",
+                        "Theta/dia": f"${sc.theta_daily_ars:,.0f}",
+                    })
+                st.dataframe(
+                    pd.DataFrame(sc_rows), hide_index=True, use_container_width=True
+                )
+                if adv.days_to_target is not None and adv.days_to_target > 0:
+                    st.caption(
+                        f"Alcanza objetivo ({adv.position.target_capture_pct:.0f}%) "
+                        f"en ~{adv.days_to_target} dias si el spot no se mueve."
+                    )
+                elif adv.days_to_target == 0:
+                    st.caption("Objetivo ya alcanzado.")
+                else:
+                    st.caption(
+                        "La theta sola no alcanza el objetivo en los proximos 21 dias."
+                    )
+                lag_label = (
+                    f"Captura {abs(adv.capture_lag_pct):.0f}pp "
+                    f"{'adelantada' if adv.capture_lag_pct > 0 else 'rezagada'} "
+                    f"respecto al ritmo esperado del plan."
+                )
+                (st.success if adv.plan_on_track else st.warning)(lag_label)
+
+        # Rotacion
+        if adv.rotate_to is not None:
+            with st.expander(f"Oportunidad de rotacion → {adv.rotate_to}"):
+                st.info(adv.rotation_rationale or "")
+                if st.button(
+                    f"Cargar cierre {adv.position.symbol} en Operar",
+                    key=f"adv_rotate_{adv.position.symbol}",
+                ):
+                    q = chain.options.get(adv.position.symbol) if chain else None
+                    is_long = "LONG" in adv.position.strategy.upper()
+                    side = "Vender" if is_long else "Comprar"
+                    px = float(
+                        (q.bid if is_long else q.ask) if q and (q.bid if is_long else q.ask) > 0
+                        else (q.mid if q and q.mid else 0.0)
+                    )
+                    _operar_set_ticket(adv.position.symbol, side, px, qty=max(adv.position.contracts, 1))
+                    st.toast(f"Ticket de cierre: {side} {adv.position.symbol}")
+
+        # Botón de acción rápida
+        if adv.action in ("CLOSE_NOW", "ROLL", "DEFEND"):
+            q = chain.options.get(adv.position.symbol) if chain else None
+            is_long = "LONG" in adv.position.strategy.upper()
+            side = "Vender" if is_long else "Comprar"
+            px = float(
+                (q.bid if is_long else q.ask) if q and (q.bid if is_long else q.ask) > 0
+                else (q.mid if q and q.mid else 0.0)
+            )
+            lbl = f"Cargar {'cierre' if adv.action == 'CLOSE_NOW' else adv.action.lower()} en Operar"
+            if st.button(lbl, key=f"adv_btn_{adv.position.symbol}",
+                         use_container_width=True, type="primary"):
+                _operar_set_ticket(adv.position.symbol, side, px, qty=max(adv.position.contracts, 1))
+                st.toast(f"Ticket: {side} {adv.position.symbol}")
+
+
+def _render_advisor_panel(
+    *,
+    positions: list,
+    spot: float,
+    chain: Optional[OptionsChain],
+    context,
+    caucion_tna: float,
+    recs: dict,
+) -> None:
+    """Panel principal del analizador intertemporal."""
+    from optionsdesk.signals.position_advisor import advise_portfolio
+
+    if not positions:
+        st.info(
+            "Sin posiciones en el ledger (data/open_positions.jsonl). "
+            "Cuando el paper executor o el bot registren una posicion, "
+            "el analizador muestra aqui que hacer con ella."
+        )
+        return
+
+    all_recs = [r for rs in recs.values() for r in rs] if recs else []
+    iv_map = _now_load_iv_map(chain, _effective_expiry_calendar(chain, _load_expiry_calendar()))
+
+    try:
+        portfolio = advise_portfolio(
+            positions,
+            current_spot=spot,
+            current_iv_map=iv_map,
+            context=context,
+            available_recs=all_recs or None,
+            caucion_tna=caucion_tna,
+        )
+    except Exception as exc:
+        st.warning(f"Error en el analizador: {exc}")
+        logger.exception("advise_portfolio fallo")
+        return
+
+    # Resumen del libro
+    urgency_fn = {
+        "alta":    st.error,
+        "media":   st.warning,
+        "baja":    st.success,
+        "ninguna": st.info,
+    }.get(portfolio.highest_urgency, st.info)
+    urgency_fn(
+        f"Urgencia maxima: **{portfolio.highest_urgency.upper()}**  ·  "
+        f"P&L capturado: **${portfolio.total_capture_ars:,.0f}**  ·  "
+        f"Theta diario del libro: **${portfolio.theta_daily_ars:,.0f}**"
+    )
+    for flag in portfolio.portfolio_flags:
+        st.caption(flag)
+
+    # Tarjeta por posicion, de más urgente a menos
+    for adv in portfolio.advices:
+        _render_advice_card(adv, chain=chain)
+
+
 def _tab_positions(
     *,
     provider,
@@ -2780,11 +3133,12 @@ def _tab_positions(
     sp_filtered=None,
     now=None,
     adaptive_context=None,
+    recs: Optional[dict] = None,
+    context=None,
 ) -> None:
-    """Vista unificada: posiciones reales (IOL) + demos automaticos + scalp/paper."""
-    st.subheader("Posiciones abiertas")
+    """Posiciones: Analizador intertemporal · Cartera IOL · Demo."""
 
-    # Actualizar demo tick
+    # Demo tick (no bloquea el render)
     try:
         from optionsdesk.backtest.options_demo import run_options_demo_tick
         if chain is not None:
@@ -2792,97 +3146,73 @@ def _tab_positions(
             if cc_filtered: cands.extend(cc_filtered)
             if sp_filtered: cands.extend(sp_filtered)
             run_options_demo_tick(
-                chain=chain,
-                candidates=cands,
-                now=now,
-                adaptive_context=adaptive_context,
-                caucion_tna_pct=caucion_tna,
+                chain=chain, candidates=cands, now=now,
+                adaptive_context=adaptive_context, caucion_tna_pct=caucion_tna,
             )
     except Exception as exc:
         logger.debug("options demo tick fallo: %s", exc)
 
-    # 1. Posiciones del bot/paper (open_positions.jsonl) — las que tienen
-    #    gestion CRR completa (TP/STOP/ROLL/DEFEND).
     bot_positions = _now_open_positions()
-    if bot_positions:
-        try:
-            from optionsdesk.signals.management import evaluate_position
-            iv_map = _now_load_iv_map(
-                chain, _effective_expiry_calendar(chain, _load_expiry_calendar())
-            )
-            rows = []
-            for pos in bot_positions:
-                iv_now = iv_map.get(pos.symbol)
-                sig = None
-                try:
-                    sig = evaluate_position(pos, spot, iv_now)
-                except Exception:
-                    pass
-                rows.append({
-                    "Simbolo": pos.symbol,
-                    "Estrategia": pos.strategy,
-                    "Strike": pos.strike,
-                    "DTE": pos.days_remaining,
-                    "Lotes": pos.contracts,
-                    "Prima entrada": pos.premium_received,
-                    "Captura %": round(sig.capture_pct, 1) if sig else "-",
-                    "Senal": _MGMT_BADGE.get(sig.signal_type.value, ("HOLD",))[0]
-                              if sig else "-",
-                })
-            st.caption("Del bot / paper / scalp tickets (con senal de gestion)")
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        except Exception as exc:
-            st.warning(f"No se pudo cargar la gestion de posiciones bot: {exc}")
-    else:
-        st.caption("Sin posiciones en el ledger del bot (data/open_positions.jsonl).")
 
-    st.divider()
+    sub_adv, sub_iol, sub_demo = st.tabs([
+        f"Analizador ({len(bot_positions)})", "Cartera IOL", "Demo",
+    ])
 
-    # 2. Posiciones reales IOL — datos crudos del broker. Sin gestion CRR
-    #    porque no tenemos el precio de entrada confiable / IV de apertura.
-    iol_rows = _positions_iol_rows()
-    if iol_rows:
-        st.caption("Cuenta IOL (datos del broker — sin gestion automatica)")
-        view = []
-        for p in iol_rows:
-            view.append({
-                "Simbolo": p.get("simbolo", ""),
-                "Cantidad": p.get("cantidad", 0),
-                "PPC": p.get("ppc", 0.0),
-                "Ultimo": p.get("ultimo", 0.0),
-                "Gan. %": p.get("ganancia_pct", 0.0),
-            })
-        st.dataframe(pd.DataFrame(view), hide_index=True, use_container_width=True)
-    else:
-        if settings.is_iol_configured():
-            st.caption("Sin posiciones de opciones GGAL en IOL.")
-        else:
-            st.caption("IOL no configurado (.env).")
-
-    # 3. Demo acciones swing — ya existe en backtest.stock_demo
-    try:
-        from optionsdesk.backtest.stock_demo import (
-            load_stock_demo_trades, positions_frame,
+    with sub_adv:
+        _render_advisor_panel(
+            positions=bot_positions, spot=spot, chain=chain,
+            context=context, caucion_tna=caucion_tna, recs=recs or {},
         )
-        from pathlib import Path as _P
-        if _P(settings.stock_demo_trades_file).exists():
-            # Posiciones abiertas del stock_demo se materializan en el tick;
-            # aca solo mostramos el historial de cerrados recientes como contexto.
-            closed = load_stock_demo_trades(_P(settings.stock_demo_trades_file), limit=10)
-            if closed:
-                with st.expander(f"Ultimos {len(closed)} trades cerrados del demo de acciones"):
-                    rows = []
-                    for t in closed:
-                        rows.append({
+
+    with sub_iol:
+        iol_rows = _positions_iol_rows()
+        if iol_rows:
+            st.caption("Cuenta IOL — datos del broker (sin gestion CRR automatica)")
+            view = [
+                {
+                    "Simbolo": p.get("simbolo", ""),
+                    "Cantidad": p.get("cantidad", 0),
+                    "PPC": p.get("ppc", 0.0),
+                    "Ultimo": p.get("ultimo", 0.0),
+                    "Gan. %": p.get("ganancia_pct", 0.0),
+                }
+                for p in iol_rows
+            ]
+            st.dataframe(pd.DataFrame(view), hide_index=True, use_container_width=True)
+            st.caption(
+                "Para analisis completo: registra estas posiciones en "
+                "data/open_positions.jsonl y aparecen en el Analizador."
+            )
+        else:
+            st.caption(
+                "Sin opciones GGAL en IOL." if settings.is_iol_configured()
+                else "IOL no configurado (.env)."
+            )
+
+    with sub_demo:
+        try:
+            from optionsdesk.backtest.stock_demo import load_stock_demo_trades
+            from pathlib import Path as _P
+            if _P(settings.stock_demo_trades_file).exists():
+                closed = load_stock_demo_trades(_P(settings.stock_demo_trades_file), limit=15)
+                if closed:
+                    rows = [
+                        {
                             "Simbolo": getattr(t, "symbol", "-"),
                             "Estrategia": getattr(t, "strategy", "-"),
-                            "PnL": getattr(t, "pnl_ars", 0.0),
+                            "PnL $": getattr(t, "pnl_ars", 0.0),
                             "Motivo": getattr(t, "exit_reason", "-"),
-                        })
-                    st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                 use_container_width=True)
-    except Exception as exc:
-        logger.debug("stock demo historial fallo: %s", exc)
+                        }
+                        for t in closed
+                    ]
+                    st.caption("Ultimos trades cerrados del demo de acciones")
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Sin trades cerrados en el demo todavia.")
+            else:
+                st.caption("Demo sin archivo de trades.")
+        except Exception as exc:
+            logger.debug("stock demo historial fallo: %s", exc)
 
 
 # ── Tab nueva: Mercado (scanner + analisis tecnico) ──────────────────────────
@@ -3199,13 +3529,13 @@ def main() -> None:
     if advanced_mode:
         tab_labels = [
             "Ahora", "Operar", "Posiciones", "Mercado",
-            "Oportunidades", "Simulador P&L", "Edge",
+            "Oportunidades", "Simulador P&L", "Edge", "Genética",
         ]
         (t_now, t_operar, t_pos, t_market,
-         t_ops, t_sim, t_edge) = st.tabs(tab_labels)
+         t_ops, t_sim, t_edge, t_genetic) = st.tabs(tab_labels)
     else:
-        (t_now, t_operar, t_pos, t_market) = st.tabs(
-            ["Ahora", "Operar", "Posiciones", "Mercado"]
+        (t_now, t_operar, t_pos, t_market, t_genetic) = st.tabs(
+            ["Ahora", "Operar", "Posiciones", "Mercado", "Genética"]
         )
 
     with t_now:
@@ -3232,6 +3562,8 @@ def main() -> None:
             sp_filtered=sp_filtered,
             now=now,
             adaptive_context=adaptive_context,
+            recs=recs,
+            context=context,
         )
 
     with t_market:
@@ -3293,6 +3625,12 @@ def _tab_edge(spot: Optional[float] = None) -> None:
         )
         if rs.get("blocked"):
             st.caption("Setups bloqueados (sin edge realizado): " + ", ".join(rs["blocked"]))
+        if rs.get("regime"):
+            st.caption(f"Estrategia desplegada por contexto: {rs['regime']}")
+
+    _render_strategy_tree()
+
+    _render_param_learner()
 
     _render_gap_stress(spot)
 
@@ -3370,6 +3708,142 @@ def _tab_edge(spot: Optional[float] = None) -> None:
             "Veredicto": badge.get(e.verdict, e.verdict),
         } for e in grade_edges]
         st.dataframe(pd.DataFrame(grows), hide_index=True, use_container_width=True)
+
+
+def _render_strategy_tree() -> None:
+    """Panel del optimizador por contexto: la mejor estrategia para cada regimen.
+
+    El edge es condicional al contexto — una estrategia que pierde en lateral puede
+    ganar en tendencia. El arbol busca y guarda un ESPECIALISTA por regimen; en vivo
+    el runner despliega el que corresponde al regimen actual.
+    """
+    try:
+        from optionsdesk.backtest.strategy_tree import load_policy_doc
+        from optionsdesk.backtest.strategy_context import regime_label_es
+    except Exception:
+        return
+
+    doc = load_policy_doc()
+    st.subheader("Estrategia optima por contexto (arbol de regimenes)")
+    if not doc:
+        st.caption(
+            "Todavia no se corrio la optimizacion. Generala con "
+            "`python -m optionsdesk.backtest.strategy_tree --evals 40` "
+            "(o desde el runner). Aprende que estrategia rinde en cada regimen de mercado."
+        )
+        return
+
+    c1, c2 = st.columns(2)
+    c1.metric("Genomas evaluados", doc.get("evaluated", 0))
+    c2.metric("Mejor fitness global", f"{doc.get('overall_fitness', 0):,.0f}")
+    st.caption(f"Ultima optimizacion: {doc.get('updated_at', '?')}")
+
+    # Tabla regimen → estrategia (especialista o fallback global).
+    regimes = doc.get("regimes", {})
+    rows = []
+    for reg, slot in regimes.items():
+        if slot.get("n", 0) <= 0 and not slot.get("specialist"):
+            continue
+        flags = (slot.get("genome", {}) or {}).get("flags", {})
+        active = [k.replace("enable_", "") for k, v in flags.items() if v]
+        rows.append({
+            "Regimen": slot.get("label") or regime_label_es(reg),
+            "Tipo": "especialista" if slot.get("specialist") else "global (fallback)",
+            "Setups activos": ", ".join(active) if active else "—",
+            "N": slot.get("n", 0),
+            "Win%": f"{slot['win_rate'] * 100:.0f}%" if slot.get("win_rate") is not None else "-",
+            "PnL": f"${slot['total_pnl_ars']:,.0f}" if slot.get("total_pnl_ars") is not None else "-",
+            "Fitness": f"{slot['fitness']:,.0f}" if slot.get("fitness") is not None else "-",
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption(
+            "Especialista = estrategia con edge propio y muestra suficiente en ESE contexto. "
+            "Donde no hay especialista confiable se cae al mejor global (nunca a un perdedor)."
+        )
+    else:
+        st.caption("Aun sin especialistas confiables — opera el mejor genoma global en todos los regimenes.")
+
+    # Mejor genoma global (params + setups).
+    best = doc.get("best_overall", {})
+    with st.expander("Mejor estrategia global (params + setups)"):
+        bp = best.get("params", {})
+        bf = best.get("flags", {})
+        if bp:
+            st.dataframe(
+                pd.DataFrame([{"param": k, "valor": v} for k, v in bp.items()]),
+                hide_index=True, use_container_width=True,
+            )
+        st.caption("Setups: " + ", ".join(f"{k}={'on' if v else 'off'}" for k, v in bf.items()))
+
+
+def _render_param_learner() -> None:
+    """Panel del optimizador de parametros: que esta probando y como le fue.
+
+    Muestra el campeon (mejor set probado), el retador en curso, la temperatura de
+    exploracion (sube cuando falla) y los parametros que se desviaron del default.
+    """
+    try:
+        from optionsdesk.backtest.param_learner import load_learner_status
+        from optionsdesk.backtest.param_store import describe_active, TUNABLES
+    except Exception:
+        return
+
+    state = load_learner_status()
+    st.subheader("Auto-tuning de parametros (SMC + señales)")
+    if not state:
+        st.caption(
+            "El optimizador todavia no corrio. Arranca con el runner continuo "
+            "(python -m optionsdesk.backtest.demo_runner) y aprende de cada trade cerrado."
+        )
+        return
+
+    action_label = {
+        "init_baseline":    "Midiendo el baseline del campeon",
+        "gathering":        "Juntando muestra del set en prueba",
+        "deploy_challenger":"Retador desplegado en vivo",
+        "promote":          "Retador PROMOVIDO a campeon",
+        "revert":           "Retador descartado",
+    }.get(state.get("last_action", ""), state.get("last_action", "—"))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Iteracion", state.get("iterations", 0))
+    c2.metric("Temperatura", f"{state.get('temperature', 0):.2f}",
+              help="Exploracion: sube cuando un retador falla, baja al promover.")
+    c3.metric("Reverts seguidos", state.get("consecutive_reverts", 0))
+    cf = state.get("champion_fitness")
+    c4.metric("Fitness campeon", f"{cf:,.0f}" if cf is not None else "—")
+
+    st.caption(f"Estado: {action_label} · {state.get('note', '')}")
+
+    # Tabla de parametros activos vs default (lo que el learner movio).
+    rows = describe_active()
+    moved = [r for r in rows if abs(r["delta_vs_default"]) > 1e-9]
+    if moved:
+        st.caption("Parametros que el learner desvio del valor de fabrica:")
+        disp = [
+            {
+                "Parametro": r["param"],
+                "Actual": r["actual"],
+                "Default": r["default"],
+                "Δ": r["delta_vs_default"],
+                "Que controla": TUNABLES[r["param"]].help if r["param"] in TUNABLES else "",
+            }
+            for r in moved
+        ]
+        st.dataframe(pd.DataFrame(disp), hide_index=True, use_container_width=True)
+    else:
+        st.caption("Aun operando con los parametros de fabrica (sin desvios probados todavia).")
+
+    # Curva de fitness reciente (si hay historial).
+    hist = state.get("history", [])
+    if len(hist) >= 2:
+        with st.expander("Historial de fitness por iteracion"):
+            fit_df = pd.DataFrame([
+                {"iter": h.get("iter"), "fitness": h.get("fitness"), "accion": h.get("action")}
+                for h in hist
+            ]).set_index("iter")
+            st.line_chart(fit_df[["fitness"]])
 
 
 def _render_gap_stress(spot: Optional[float]) -> None:

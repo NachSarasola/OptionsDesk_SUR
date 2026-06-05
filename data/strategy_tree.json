@@ -1,0 +1,249 @@
+{
+  "updated_at": "2026-06-05T10:39:50-03:00",
+  "evaluated": 8,
+  "overall_fitness": -138823.34,
+  "best_overall": {
+    "params": {
+      "smc_eql_tolerance": 0.00245,
+      "smc_pda_lookback": 60,
+      "stock_min_net_rr": 0.4,
+      "stock_max_breakout_extension": 0.05,
+      "rvol_explosive_threshold": 2.58238,
+      "rvol_high_threshold": 1.5,
+      "rvol_lookback": 20
+    },
+    "flags": {
+      "enable_smc_reversal": false,
+      "enable_swing_pullback": true,
+      "enable_swing_breakout": true
+    }
+  },
+  "regimes": {
+    "up/hi": {
+      "label": "alcista · vol alta",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 0,
+      "fitness": null,
+      "total_pnl_ars": null,
+      "win_rate": null
+    },
+    "up/lo": {
+      "label": "alcista · vol baja",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 0,
+      "fitness": null,
+      "total_pnl_ars": null,
+      "win_rate": null
+    },
+    "side/hi": {
+      "label": "lateral · vol alta",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 1,
+      "fitness": -10073.81,
+      "total_pnl_ars": -13894.91,
+      "win_rate": 0.0
+    },
+    "side/lo": {
+      "label": "lateral · vol baja",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 6,
+      "fitness": -108300.52,
+      "total_pnl_ars": -80222.61,
+      "win_rate": 0.0
+    },
+    "down/hi": {
+      "label": "bajista · vol alta",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 0,
+      "fitness": null,
+      "total_pnl_ars": null,
+      "win_rate": null
+    },
+    "down/lo": {
+      "label": "bajista · vol baja",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 0,
+      "fitness": null,
+      "total_pnl_ars": null,
+      "win_rate": null
+    },
+    "unknown": {
+      "label": "sin datos",
+      "genome": {
+        "params": {
+          "smc_eql_tolerance": 0.00245,
+          "smc_pda_lookback": 60,
+          "stock_min_net_rr": 0.4,
+          "stock_max_breakout_extension": 0.05,
+          "rvol_explosive_threshold": 2.58238,
+          "rvol_high_threshold": 1.5,
+          "rvol_lookback": 20
+        },
+        "flags": {
+          "enable_smc_reversal": false,
+          "enable_swing_pullback": true,
+          "enable_swing_breakout": true
+        }
+      },
+      "specialist": false,
+      "n": 0,
+      "fitness": null,
+      "total_pnl_ars": null,
+      "win_rate": null
+    }
+  },
+  "tree": [
+    {
+      "id": 0,
+      "parent": null,
+      "depth": 0,
+      "fitness": -286493.68,
+      "n": 13
+    },
+    {
+      "id": 1,
+      "parent": 0,
+      "depth": 1,
+      "fitness": -286493.68,
+      "n": 13
+    },
+    {
+      "id": 2,
+      "parent": 0,
+      "depth": 1,
+      "fitness": -286493.68,
+      "n": 13
+    },
+    {
+      "id": 3,
+      "parent": 0,
+      "depth": 1,
+      "fitness": -138823.34,
+      "n": 7
+    },
+    {
+      "id": 4,
+      "parent": 3,
+      "depth": 2,
+      "fitness": -138823.34,
+      "n": 7
+    },
+    {
+      "id": 5,
+      "parent": 3,
+      "depth": 2,
+      "fitness": -138823.34,
+      "n": 7
+    },
+    {
+      "id": 6,
+      "parent": 3,
+      "depth": 2,
+      "fitness": -286493.68,
+      "n": 13
+    },
+    {
+      "id": 7,
+      "parent": 0,
+      "depth": 1,
+      "fitness": -286493.68,
+      "n": 13
+    }
+  ]
+}
