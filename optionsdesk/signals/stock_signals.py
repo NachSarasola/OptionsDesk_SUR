@@ -215,7 +215,7 @@ def scan_stock_symbol(
     for sig in _scan_swings(symbol.upper(), quote, daily, weekly, current):
         if not _setup_enabled(sig.signal_type):
             continue
-        if sig.risk_per_share <= 0 or sig.rr < 1.2:
+        if sig.risk_per_share <= 0 or sig.rr < _learned("stock_min_gross_rr", 1.2):
             continue
         priced = _apply_costs(sig, costs)
         if priced.net_rr < min_net_rr:
@@ -316,7 +316,9 @@ def _scan_smc_reversal(
 
     day  = _normalize_daily(daily)
     atr  = _atr(day)
-    stop = max(ssl_level * 0.993, entry - 2.5 * atr)   # bajo el nivel del sweep
+    stop_mult = _learned("smc_reversal_stop_atr_mult", 2.5)
+    target_mult = _learned("smc_reversal_target_atr_mult", 2.0)
+    stop = max(ssl_level * 0.993, entry - stop_mult * atr)   # bajo el nivel del sweep
 
     # Target: primer BSL no barrido por encima del spot
     liquidity = getattr(smc_ctx, "liquidity", [])
@@ -331,7 +333,7 @@ def _scan_smc_reversal(
         target      = target_lv.price
         target_note = f"BSL {target_lv.label} ${target_lv.price:,.0f}"
     else:
-        target      = entry + 2.0 * atr
+        target      = entry + target_mult * atr
         target_note = f"2×ATR ${target:,.0f}"
 
     risk = entry - stop
@@ -627,12 +629,15 @@ def _scan_swings(
 
     signals: list[StockSignal] = []
 
-    lower_keltner = sma20 - (2.0 * atr)
+    keltner_mult = _learned("stock_pullback_keltner_atr_mult", 2.0)
+    rsi_min = _learned("stock_pullback_rsi_min", 30.0)
+    rsi_max = _learned("stock_pullback_rsi_max", 65.0)
+    lower_keltner = sma20 - (keltner_mult * atr)
     pullback_ok = (
         weekly_up
         and sma20 >= sma50 * 0.98
         and entry <= lower_keltner * 1.04     # precio tocando/cerca de la banda inferior (zona extendida)
-        and 30.0 <= rsi <= 65.0               # RSI relajado
+        and rsi_min <= rsi <= rsi_max         # RSI relajado
         and entry >= prior_close * 0.995       # no está en caída libre
     )
     if pullback_ok:
@@ -654,7 +659,7 @@ def _scan_swings(
     # 2. Breakout estilo Minervini (trend template) sobre el rango de 20 ruedas.
     prior_high = float(high.iloc[-21:-1].max()) if len(high) >= 21 else float(high.iloc[:-1].max())
     avg_vol = float(volume.tail(20).mean() or 0.0)
-    vol_ok = avg_vol <= 0 or float(volume.iloc[-1]) >= avg_vol * 1.10
+    vol_ok = avg_vol <= 0 or float(volume.iloc[-1]) >= avg_vol * _learned("stock_breakout_volume_mult", 1.10)
     trend_template_ok = (
         entry > sma200
         and sma50 > sma200

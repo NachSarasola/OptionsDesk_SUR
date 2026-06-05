@@ -19,6 +19,7 @@ from optionsdesk.data.macro import get_merval_trend, get_ccl_momentum
 logger = logging.getLogger(__name__)
 
 POPULATION_FILE = Path("data/genetic_population.json")
+LINEAGE_FILE = Path("data/genetic_lineage.json")
 
 
 @dataclass
@@ -58,6 +59,9 @@ class PaperBot:
     id: str
     generation: int
     genome: Genome
+    parent_id: Optional[str] = None
+    status: str = "alive"
+    death_generation: Optional[int] = None
     capital: float = 1_000_000.0
     initial_capital: float = 1_000_000.0
     open_positions: list[StockDemoPosition] = field(default_factory=list)
@@ -71,6 +75,9 @@ class PaperBot:
             "id": self.id,
             "generation": self.generation,
             "genome": self.genome.__dict__,
+            "parent_id": self.parent_id,
+            "status": self.status,
+            "death_generation": self.death_generation,
             "capital": self.capital,
             "initial_capital": self.initial_capital,
             "open_positions": [p.__dict__ for p in self.open_positions],
@@ -83,6 +90,9 @@ class PaperBot:
             id=data["id"],
             generation=data.get("generation", 0),
             genome=Genome(**data["genome"]),
+            parent_id=data.get("parent_id"),
+            status=data.get("status", "alive"),
+            death_generation=data.get("death_generation"),
             capital=data.get("capital", 1_000_000.0),
             initial_capital=data.get("initial_capital", 1_000_000.0),
             closed_trades=data.get("closed_trades", [])
@@ -95,23 +105,34 @@ class EvolutionEngine:
     def __init__(self, population_size: int = 20):
         self.population_size = population_size
         self.bots: list[PaperBot] = []
+        self.historical_bots: list[PaperBot] = []
         self._load()
         if not self.bots:
             self._genesis()
 
     def _load(self):
-        if not POPULATION_FILE.exists():
-            return
-        try:
-            raw = json.loads(POPULATION_FILE.read_text(encoding="utf-8"))
-            self.bots = [PaperBot.from_dict(b) for b in raw]
-        except Exception as e:
-            logger.error(f"Error cargando poblacion genetica: {e}")
+        if POPULATION_FILE.exists():
+            try:
+                raw = json.loads(POPULATION_FILE.read_text(encoding="utf-8"))
+                self.bots = [PaperBot.from_dict(b) for b in raw]
+            except Exception as e:
+                logger.error(f"Error cargando poblacion genetica: {e}")
+                
+        if LINEAGE_FILE.exists():
+            try:
+                raw = json.loads(LINEAGE_FILE.read_text(encoding="utf-8"))
+                self.historical_bots = [PaperBot.from_dict(b) for b in raw]
+            except Exception as e:
+                logger.error(f"Error cargando linaje: {e}")
 
     def _save(self):
         POPULATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        raw = [b.to_dict() for b in self.bots]
-        POPULATION_FILE.write_text(json.dumps(raw, default=str, indent=2), encoding="utf-8")
+        
+        raw_bots = [b.to_dict() for b in self.bots]
+        POPULATION_FILE.write_text(json.dumps(raw_bots, default=str, indent=2), encoding="utf-8")
+        
+        raw_hist = [b.to_dict() for b in self.historical_bots]
+        LINEAGE_FILE.write_text(json.dumps(raw_hist, default=str, indent=2), encoding="utf-8")
 
     def _genesis(self):
         """Generación 0."""
@@ -119,6 +140,7 @@ class EvolutionEngine:
             PaperBot(id=str(uuid.uuid4())[:8], generation=0, genome=Genome.random_genesis())
             for _ in range(self.population_size)
         ]
+        self.historical_bots = list(self.bots)
         self._save()
 
     def step(self, signals: list, quotes: dict):
@@ -213,6 +235,15 @@ class EvolutionEngine:
         
         half = self.population_size // 2
         winners = self.bots[:half]
+        losers = self.bots[half:]
+        
+        # Marcar perdedores como muertos en el historial
+        for l in losers:
+            for hb in self.historical_bots:
+                if hb.id == l.id:
+                    hb.status = "dead"
+                    hb.death_generation = winners[0].generation + 1
+                    break
         
         new_generation = []
         # Conservar ganadores
@@ -225,10 +256,12 @@ class EvolutionEngine:
                 id=str(uuid.uuid4())[:8],
                 generation=w.generation + 1,
                 genome=child_genome,
+                parent_id=w.id,
                 capital=1_000_000.0,
                 initial_capital=1_000_000.0
             )
             new_generation.append(child)
+            self.historical_bots.append(child)
             
         self.bots = new_generation
         self._save()

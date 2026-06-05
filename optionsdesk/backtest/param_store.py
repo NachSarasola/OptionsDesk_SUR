@@ -79,6 +79,41 @@ TUNABLES: dict[str, TunableParam] = {
         setups=("STOCK_SWING_BREAKOUT",),
         help="Extension maxima sobre el pivote para un breakout no tardio (regla Minervini).",
     ),
+    "stock_min_gross_rr": TunableParam(
+        name="stock_min_gross_rr", default=1.2, lo=1.0, hi=2.5, scale=0.25,
+        setups=("STOCK_SWING_BREAKOUT", "STOCK_SWING_TREND_PULLBACK", "STOCK_SMC_REVERSAL"),
+        help="R/R bruto minimo antes de costos; evita trades con recorrido insuficiente.",
+    ),
+    "stock_pullback_keltner_atr_mult": TunableParam(
+        name="stock_pullback_keltner_atr_mult", default=2.0, lo=1.2, hi=3.2, scale=0.35,
+        setups=("STOCK_SWING_TREND_PULLBACK",),
+        help="Multiplicador ATR de la banda Keltner usada para detectar pullbacks operables.",
+    ),
+    "stock_pullback_rsi_min": TunableParam(
+        name="stock_pullback_rsi_min", default=30.0, lo=20.0, hi=45.0, scale=4.0,
+        setups=("STOCK_SWING_TREND_PULLBACK",),
+        help="RSI minimo para evitar comprar caida libre en pullbacks.",
+    ),
+    "stock_pullback_rsi_max": TunableParam(
+        name="stock_pullback_rsi_max", default=65.0, lo=55.0, hi=75.0, scale=4.0,
+        setups=("STOCK_SWING_TREND_PULLBACK",),
+        help="RSI maximo para no comprar pullbacks ya recalentados.",
+    ),
+    "stock_breakout_volume_mult": TunableParam(
+        name="stock_breakout_volume_mult", default=1.10, lo=1.0, hi=2.0, scale=0.18,
+        setups=("STOCK_SWING_BREAKOUT",),
+        help="Volumen minimo vs promedio para validar breakout en BYMA.",
+    ),
+    "smc_reversal_stop_atr_mult": TunableParam(
+        name="smc_reversal_stop_atr_mult", default=2.5, lo=1.2, hi=4.0, scale=0.45,
+        setups=("STOCK_SMC_REVERSAL",),
+        help="Distancia maxima del stop SMC medida en ATR.",
+    ),
+    "smc_reversal_target_atr_mult": TunableParam(
+        name="smc_reversal_target_atr_mult", default=2.0, lo=1.2, hi=4.5, scale=0.45,
+        setups=("STOCK_SMC_REVERSAL",),
+        help="Target fallback SMC cuando no hay liquidez BSL limpia arriba.",
+    ),
     # ── Volumen (volume_momentum.py) — detectar la ola temprano en BYMA ─────────
     "rvol_explosive_threshold": TunableParam(
         name="rvol_explosive_threshold", default=2.5, lo=1.5, hi=4.0, scale=0.4,

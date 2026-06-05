@@ -229,10 +229,11 @@ class ChainRecorder:
 
 def _build_provider() -> MarketDataProvider:
     """Construye una fuente real para no grabar datos sinteticos por accidente."""
-    if settings.is_primary_configured():
+    preference = getattr(settings, "market_data_provider", "AUTO")
+    if preference in {"AUTO", "PRIMARY"} and settings.is_primary_configured():
         from optionsdesk.data.providers.primary import PrimaryProvider
         provider: MarketDataProvider = PrimaryProvider()
-    elif settings.is_iol_configured():
+    elif preference in {"AUTO", "IOL"} and settings.is_iol_configured():
         from optionsdesk.data.providers.iol import IOLProvider
         provider = IOLProvider()
     else:

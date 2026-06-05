@@ -19,7 +19,7 @@ from optionsdesk.backtest.strategy_backtest import (
     StrategyGenome, evaluate_genome,
 )
 from optionsdesk.backtest.strategy_tree import (
-    StrategyPolicy, deploy_for_regime, mutate, save_policy, search,
+    StrategyPolicy, deploy_for_regime, mutate, policy_deployability, save_policy, search,
 )
 
 
@@ -196,7 +196,12 @@ class TestSearch:
         out = search(hist, max_evals=6, rng=random.Random(0), **_FAST)
         save_policy(out, path=tmp_path / "strategy_tree.json")
         # Desplegar un regimen escribe params+flags al store.
-        msg = deploy_for_regime("up/hi", data_dir=tmp_path, policy_path=tmp_path / "strategy_tree.json")
+        msg = deploy_for_regime(
+            "up/hi",
+            data_dir=tmp_path,
+            policy_path=tmp_path / "strategy_tree.json",
+            require_deployable=False,
+        )
         assert msg is not None
         # El archivo de params activos quedo escrito.
         assert (tmp_path / "learned_params.json").exists()
@@ -204,3 +209,8 @@ class TestSearch:
     def test_deploy_without_policy_returns_none(self, tmp_path):
         assert deploy_for_regime("up/hi", data_dir=tmp_path,
                                  policy_path=tmp_path / "nope.json") is None
+
+    def test_negative_policy_is_not_deployable(self):
+        ok, reason = policy_deployability({"overall_fitness": -1, "overall_n": 99})
+        assert ok is False
+        assert "fitness" in reason

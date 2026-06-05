@@ -361,7 +361,8 @@ def _inject_css() -> None:
 
 @st.cache_resource
 def _build_provider() -> MarketDataProvider:
-    if settings.is_primary_configured():
+    preference = getattr(settings, "market_data_provider", "AUTO")
+    if preference in {"AUTO", "PRIMARY"} and settings.is_primary_configured():
         try:
             from optionsdesk.data.providers.primary import PrimaryProvider
             p = PrimaryProvider()
@@ -369,8 +370,10 @@ def _build_provider() -> MarketDataProvider:
             return p
         except Exception as exc:
             st.warning(f"Primary no disponible ({exc}). Intentando fuente alternativa.")
+            if preference == "PRIMARY":
+                raise
 
-    if settings.is_iol_configured():
+    if preference in {"AUTO", "IOL"} and settings.is_iol_configured():
         try:
             from optionsdesk.data.providers.iol import IOLProvider
             p = IOLProvider()
@@ -378,6 +381,8 @@ def _build_provider() -> MarketDataProvider:
             return p
         except Exception as exc:
             st.warning(f"IOL no disponible ({exc}). Intentando fuente alternativa.")
+            if preference == "IOL":
+                raise
 
     try:
         from optionsdesk.data.providers.byma_open import BymaOpenProvider
@@ -3627,6 +3632,19 @@ def _tab_edge(spot: Optional[float] = None) -> None:
             st.caption("Setups bloqueados (sin edge realizado): " + ", ".join(rs["blocked"]))
         if rs.get("regime"):
             st.caption(f"Estrategia desplegada por contexto: {rs['regime']}")
+        extra = []
+        if rs.get("market_data_source"):
+            extra.append(f"feed {rs['market_data_source']}")
+        if rs.get("policy_status"):
+            extra.append(f"politica {rs['policy_status']}")
+        if rs.get("universe_source"):
+            extra.append(f"universo {rs['universe_source']}")
+        if extra:
+            st.caption(" | ".join(extra))
+        if rs.get("stock_universe"):
+            st.caption("Top universo: " + ", ".join(rs["stock_universe"]))
+        if rs.get("fetch_error"):
+            st.warning(f"Fetch runner: {rs['fetch_error']}")
 
     _render_strategy_tree()
 

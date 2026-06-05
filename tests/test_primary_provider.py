@@ -115,6 +115,37 @@ def test_primary_market_data_updates_chain_incrementally():
     assert provider.get_health().source == "PRIMARY"
 
 
+def test_primary_discovers_and_streams_stock_universe_quotes(monkeypatch):
+    from optionsdesk.data.providers import primary
+
+    monkeypatch.setattr(primary.settings, "stock_universe", "GGAL,YPFD")
+    provider = PrimaryProvider(
+        base_url="https://example.test",
+        user="user",
+        password="password",
+    )
+    provider._configure_instruments([
+        *_instruments(),
+        {"instrumentId": {"symbol": "MERV - XMEV - YPFD - 24hs"}},
+    ])
+    provider._connected = True
+
+    provider._on_ws_message(None, json.dumps({
+        "type": "Md",
+        "instrumentId": {"symbol": "MERV - XMEV - YPFD - 24hs"},
+        "marketData": {
+            "BI": [{"price": 29900, "size": 10}],
+            "OF": [{"price": 30100, "size": 20}],
+            "LA": {"price": 30000, "size": 5},
+            "NV": {"size": 123},
+        },
+    }))
+
+    quotes = provider.get_quotes(["YPFD"])
+    assert provider._stock_symbols["YPFD"] == "MERV - XMEV - YPFD - 24hs"
+    assert quotes["YPFD"].mid == pytest.approx(30000)
+
+
 def test_primary_subscription_batches_at_1000_symbols():
     provider = PrimaryProvider(
         base_url="https://example.test",

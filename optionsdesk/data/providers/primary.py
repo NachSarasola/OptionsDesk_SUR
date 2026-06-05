@@ -44,6 +44,10 @@ _GGAL_TOKEN_RE = re.compile(r"(?<![A-Z0-9])GGAL(?![A-Z0-9])", re.I)
 _EXPIRY_CODE_RE = re.compile(r"([A-Z]+)$")
 
 
+def _stock_token_re(symbol: str) -> re.Pattern:
+    return re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])", re.I)
+
+
 def _derive_ws_url(base_url: str) -> str:
     parts = urlsplit(base_url)
     scheme = "wss" if parts.scheme == "https" else "ws"
@@ -219,6 +223,9 @@ class PrimaryProvider(MarketDataProvider):
         self._spot: Optional[Quote] = None
         self._caucion: Optional[Quote] = None
         self._options: dict[str, Quote] = {}
+        self._stock_symbols: dict[str, str] = {}
+        self._raw_stock_to_local: dict[str, str] = {}
+        self._stock_quotes: dict[str, Quote] = {}
         self._connected_monotonic = 0.0
         self._last_update_monotonic = 0.0
         self._last_reconnect_attempt = 0.0
@@ -363,6 +370,31 @@ class PrimaryProvider(MarketDataProvider):
         self.ensure_realtime_connection()
         with self._lock:
             return self._spot
+
+    def get_quote(self, symbol: str) -> Optional[Quote]:
+        self.ensure_realtime_connection()
+        key = str(symbol or "").upper().strip()
+        if not key:
+            return None
+        with self._lock:
+            if key == self._UNDERLYING:
+                return self._stock_quotes.get(key) or self._spot
+            return self._stock_quotes.get(key)
+
+    def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        self.ensure_realtime_connection()
+        if not self._ready_event.is_set():
+            self.wait_until_ready(timeout_s=1.0)
+        wanted = {str(s).upper().strip() for s in symbols if str(s).strip()}
+        with self._lock:
+            out = {
+                sym: quote
+                for sym, quote in self._stock_quotes.items()
+                if sym in wanted
+            }
+            if self._UNDERLYING in wanted and self._spot is not None:
+                out.setdefault(self._UNDERLYING, self._spot)
+        return out
 
     def get_options_chain(self) -> Optional[OptionsChain]:
         self.ensure_realtime_connection()
@@ -528,7 +560,12 @@ class PrimaryProvider(MarketDataProvider):
             if maturity is not None and code_match is not None:
                 expiry_calendar[code_match.group(1)] = maturity
 
-        spot_symbol = self._configured_spot_symbol or self._select_spot_symbol(available_symbols)
+        stock_symbols = self._select_stock_symbols(available_symbols)
+        spot_symbol = (
+            self._configured_spot_symbol
+            or stock_symbols.get(self._UNDERLYING)
+            or self._select_spot_symbol(available_symbols)
+        )
         if not spot_symbol:
             raise RuntimeError(
                 "Primary no encontro el spot GGAL. Configura PRIMARY_SPOT_SYMBOL."
@@ -538,6 +575,9 @@ class PrimaryProvider(MarketDataProvider):
 
         with self._lock:
             self._spot_symbol = spot_symbol
+            stock_symbols[self._UNDERLYING] = spot_symbol
+            self._stock_symbols = stock_symbols
+            self._raw_stock_to_local = {raw: local for local, raw in stock_symbols.items()}
             self._option_symbols = option_symbols
             self._market_ids = market_ids
             self._expiry_calendar = expiry_calendar
@@ -550,6 +590,11 @@ class PrimaryProvider(MarketDataProvider):
                 for symbol, quote in self._options.items()
                 if symbol in option_symbols.values()
             }
+            self._stock_quotes = {
+                symbol: quote
+                for symbol, quote in self._stock_quotes.items()
+                if symbol in stock_symbols
+            }
 
     def _select_spot_symbol(self, symbols: list[str]) -> str:
         matches = [
@@ -557,6 +602,34 @@ class PrimaryProvider(MarketDataProvider):
             if _GGAL_TOKEN_RE.search(symbol) and _canonical_option_symbol(symbol) is None
         ]
         return min(matches, key=self._spot_symbol_rank) if matches else ""
+
+    def _select_stock_symbols(self, symbols: list[str]) -> dict[str, str]:
+        selected: dict[str, str] = {}
+        for local in settings.stock_universe_symbols():
+            token = _stock_token_re(local)
+            matches = [
+                symbol for symbol in symbols
+                if token.search(symbol) and _canonical_option_symbol(symbol) is None
+            ]
+            if matches:
+                selected[local] = min(matches, key=lambda raw: self._stock_symbol_rank(local, raw))
+        return selected
+
+    @staticmethod
+    def _stock_symbol_rank(local: str, symbol: str) -> tuple[int, int]:
+        upper = symbol.upper()
+        local = local.upper()
+        if upper == f"MERV - XMEV - {local} - 24HS":
+            return (0, len(symbol))
+        if upper.endswith(" - 24HS"):
+            return (1, len(symbol))
+        if upper == local:
+            return (2, len(symbol))
+        if upper.endswith(" - CI"):
+            return (3, len(symbol))
+        if upper.endswith(" - 48HS"):
+            return (4, len(symbol))
+        return (5, len(symbol))
 
     @staticmethod
     def _spot_symbol_rank(symbol: str) -> tuple[int, int]:
@@ -630,6 +703,7 @@ class PrimaryProvider(MarketDataProvider):
             self._spot = None
             self._caucion = None
             self._options = {}
+            self._stock_quotes = {}
         self._ready_event.clear()
         self._last_update_monotonic = 0.0
 
@@ -647,7 +721,7 @@ class PrimaryProvider(MarketDataProvider):
             self._open_event.set()
 
     def _send_subscriptions(self, ws: Any) -> None:
-        symbols = [self._spot_symbol, *self._option_symbols]
+        symbols = [self._spot_symbol, *self._stock_symbols.values(), *self._option_symbols]
         if self._caucion_symbol:
             symbols.append(self._caucion_symbol)
         symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
@@ -688,12 +762,19 @@ class PrimaryProvider(MarketDataProvider):
 
             with self._lock:
                 if raw_symbol == self._spot_symbol:
-                    self._spot = _parse_market_data_quote(
+                    quote = _parse_market_data_quote(
                         self._UNDERLYING, market_data, self._spot
                     )
+                    self._spot = quote
+                    self._stock_quotes[self._UNDERLYING] = quote
                 elif raw_symbol == self._caucion_symbol:
                     self._caucion = _parse_market_data_quote(
                         raw_symbol, market_data, self._caucion
+                    )
+                elif raw_symbol in self._raw_stock_to_local:
+                    local = self._raw_stock_to_local[raw_symbol]
+                    self._stock_quotes[local] = _parse_market_data_quote(
+                        local, market_data, self._stock_quotes.get(local)
                     )
                 else:
                     canonical = self._option_symbols.get(raw_symbol)

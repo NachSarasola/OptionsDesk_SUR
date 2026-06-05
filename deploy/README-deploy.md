@@ -41,21 +41,25 @@ Al terminar te muestra la URL: `http://<IP_DEL_VPS>`.
 |----------|----------|
 | `optionsdesk-dashboard` | Streamlit en :8501 (nginx hace proxy → :80) |
 | `optionsdesk-recorder` | Graba snapshots. Prefiere Primary WebSocket; con IOL REST aplica un piso conservador de 900s |
+| `optionsdesk-demo-runner` | Corre el laboratorio demo `LAB_INFINITE` 24/7 durante rueda; selecciona top 20 por liquidez y aprende por forwardtesting |
 | `optionsdesk-monitor.timer` | Dispara el monitor de posiciones cada 5 min (L-V 10:30-17:00) |
 
 ```bash
 # Ver estado
 systemctl status optionsdesk-dashboard
 systemctl status optionsdesk-recorder
+systemctl status optionsdesk-demo-runner
 systemctl list-timers optionsdesk-monitor.timer
 
 # Logs en vivo
 journalctl -fu optionsdesk-dashboard
 journalctl -fu optionsdesk-recorder
+journalctl -fu optionsdesk-demo-runner
 
 # Reiniciar manualmente
 systemctl restart optionsdesk-dashboard
 systemctl restart optionsdesk-recorder
+systemctl restart optionsdesk-demo-runner
 ```
 
 ---
@@ -74,7 +78,7 @@ O más quirúrgico:
 sudo rsync -a --exclude '.git' --exclude '.venv' --exclude 'data' --exclude '.env' \
     ./ /opt/optionsdesk/
 sudo -u optionsdesk /opt/optionsdesk/.venv/bin/pip install -q -e /opt/optionsdesk
-sudo systemctl restart optionsdesk-dashboard optionsdesk-recorder
+sudo systemctl restart optionsdesk-dashboard optionsdesk-recorder optionsdesk-demo-runner
 ```
 
 ---
@@ -146,6 +150,8 @@ journalctl -n 20 -u optionsdesk-monitor
 # Primary Trading API / Matriz OMS (recomendado para datos realtime)
 # Sandbox gratuito: https://api.remarkets.primary.com.ar
 # Produccion: usar el host xOMS informado por tu ALyC.
+# Hasta homologar Primary, dejar IOL. Luego cambiar a PRIMARY o AUTO.
+MARKET_DATA_PROVIDER=IOL
 PRIMARY_BASE_URL=https://api.remarkets.primary.com.ar
 PRIMARY_USER=tu_usuario
 PRIMARY_PASSWORD=tu_password
@@ -162,6 +168,14 @@ IOL_RECORDER_INTERVAL_S=900
 IOL_OPTION_QUOTES_PER_CYCLE=8
 IOL_OPTIONS_LIST_TTL_S=900
 SPOT_TAPE_INTERVAL_S=60
+
+# Laboratorio demo
+STOCK_DEMO_MODE=LAB_INFINITE
+STOCK_UNIVERSE_TOP_N=20
+STOCK_UNIVERSE_VOLUME_LOOKBACK=20
+LAB_INFINITE_CAPITAL_ARS=1000000000000
+STRATEGY_TREE_MIN_DEPLOY_FITNESS=0
+STRATEGY_TREE_MIN_DEPLOY_TRADES=12
 
 # Telegram (opcional — alertas)
 TELEGRAM_TOKEN=

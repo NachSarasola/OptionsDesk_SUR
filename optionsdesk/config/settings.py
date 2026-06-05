@@ -42,6 +42,10 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 @dataclass
 class Settings:
+    market_data_provider: str = field(
+        default_factory=lambda: os.environ.get("MARKET_DATA_PROVIDER", "AUTO").upper()
+    )
+
     # Primary Trading API / Matriz OMS. El host depende del ALyC:
     # p.ej. https://api.remarkets.primary.com.ar para sandbox.
     primary_base_url: str = field(
@@ -126,8 +130,21 @@ class Settings:
             "GGAL,YPFD,PAMP,BBAR,SUPV,COME,ALUA,TXAR,CEPU,EDN,TGSU2,TRAN,LOMA,BYMA,VALO,MIRG",
         )
     )
+    stock_universe_top_n: int = field(
+        default_factory=lambda: max(_env_int("STOCK_UNIVERSE_TOP_N", 20), 1)
+    )
+    stock_universe_volume_lookback: int = field(
+        default_factory=lambda: max(_env_int("STOCK_UNIVERSE_VOLUME_LOOKBACK", 20), 5)
+    )
     stock_demo_trade_ars: float = field(
         default_factory=lambda: _env_float("STOCK_DEMO_TRADE_ARS", 100_000.0) or 100_000.0
+    )
+    stock_demo_mode: str = field(
+        default_factory=lambda: os.environ.get("STOCK_DEMO_MODE", "LAB_INFINITE").upper()
+    )
+    lab_infinite_capital_ars: float = field(
+        default_factory=lambda: _env_float("LAB_INFINITE_CAPITAL_ARS", 1_000_000_000_000.0)
+        or 1_000_000_000_000.0
     )
     stock_demo_max_scalps: int = field(
         default_factory=lambda: _env_int("STOCK_DEMO_MAX_SCALPS", 0)
@@ -154,6 +171,12 @@ class Settings:
     )
     circuit_breaker_drawdown_pct: float = field(
         default_factory=lambda: _env_float("CIRCUIT_BREAKER_DRAWDOWN_PCT", 5.0) or 5.0
+    )
+    strategy_tree_min_deploy_fitness: float = field(
+        default_factory=lambda: _env_float("STRATEGY_TREE_MIN_DEPLOY_FITNESS", 0.0) or 0.0
+    )
+    strategy_tree_min_deploy_trades: int = field(
+        default_factory=lambda: max(_env_int("STRATEGY_TREE_MIN_DEPLOY_TRADES", 12), 1)
     )
     stock_max_spread_pct: float = field(
         default_factory=lambda: _env_float("STOCK_MAX_SPREAD_PCT", 2.5) or 2.5

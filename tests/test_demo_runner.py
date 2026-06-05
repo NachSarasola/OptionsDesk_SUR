@@ -42,6 +42,20 @@ def test_state_not_halted_when_profitable(tmp_path):
     assert state.blocked == set()                          # nada que cortar
 
 
+def test_lab_infinite_never_halts_on_drawdown(tmp_path):
+    _seed(tmp_path, [-5000.0] * 16)
+    state = compute_self_learning_state(
+        data_dir=tmp_path,
+        capital=100_000.0,
+        max_drawdown_pct=8.0,
+        since="2026-01-01",
+        lab_infinite=True,
+    )
+    assert state.halted is False
+    assert state.lab_infinite is True
+    assert "LAB_INFINITE" in state.note
+
+
 def test_small_sample_protects_new_setup(tmp_path):
     _seed(tmp_path, [-5000.0] * 5)                         # pocos trades
     state = compute_self_learning_state(data_dir=tmp_path, capital=1_000_000.0, since="2026-01-01")
@@ -59,6 +73,26 @@ def test_run_cycle_empty_inputs_writes_status(tmp_path):
     assert status.halted is False
     saved = load_runner_status(status_file)
     assert saved is not None and saved["mode"] == status.mode
+
+
+def test_run_cycle_lab_status_keeps_universe_and_feed(tmp_path):
+    status_file = tmp_path / "status.json"
+    status = run_cycle(
+        lambda: CycleInputs(
+            stock_universe=["GGAL", "YPFD"],
+            universe_source="history",
+            market_data_source="IOL",
+        ),
+        now=datetime(2026, 6, 3, 12, 0, tzinfo=BA),
+        data_dir=tmp_path,
+        capital=1_000_000.0,
+        status_path=status_file,
+        lab_infinite=True,
+    )
+    assert status.mode == "LAB_INFINITE"
+    assert status.stock_universe == ["GGAL", "YPFD"]
+    saved = load_runner_status(status_file)
+    assert saved is not None and saved["market_data_source"] == "IOL"
 
 
 def test_market_open_hours():

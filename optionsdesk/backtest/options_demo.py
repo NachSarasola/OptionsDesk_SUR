@@ -12,7 +12,7 @@ from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from optionsdesk.config.settings import settings
-from optionsdesk.data.providers.base import OptionChain
+from optionsdesk.data.providers.base import OptionsChain
 from optionsdesk.signals.management import evaluate_position, SignalType
 from optionsdesk.signals.monitor import OpenPosition
 from optionsdesk.signals.screener import RateResult
@@ -39,17 +39,21 @@ class OptionsDemoTrade:
 
 
 def run_options_demo_tick(
-    chain: OptionChain,
+    chain: OptionsChain,
     candidates: Iterable[RateResult],
     now: Optional[datetime] = None,
     adaptive_context: Optional[AdaptiveContext] = None,
     caucion_tna_pct: float = 60.0,
     block_junk: bool = True,
     allow_new: bool = True,
+    lab_infinite: bool = False,
+    capital: Optional[float] = None,
 ) -> dict:
     current = _to_ba(now or datetime.now(_BA))
     pos_file = Path("data/options_demo_positions.json")
     trade_file = Path("data/options_demo_trades.jsonl")
+    if lab_infinite:
+        block_junk = False
 
     # Gate anti-basura: no abrir estrategias con edge realizado negativo probado.
     blocked: set = set()
@@ -112,15 +116,22 @@ def run_options_demo_tick(
         survivors.append(p)
         
     # 2. Enter new positions if space available
-    base_capital = 1_800_000.0
-    kelly_pct = adaptive_context.half_kelly_pct if adaptive_context else 0.05
+    base_capital = float(
+        capital
+        if capital is not None
+        else settings.lab_infinite_capital_ars
+        if lab_infinite
+        else 1_800_000.0
+    )
+    kelly_pct = 0.05 if lab_infinite else adaptive_context.half_kelly_pct if adaptive_context else 0.05
     max_risk_ars = base_capital * kelly_pct
     
     positions = survivors
     
     # Simple limit: 2 options positions max. allow_new=False frena aperturas
     # (circuit breaker de drawdown) pero sigue gestionando las posiciones abiertas.
-    if allow_new and len(positions) < 2 and candidates:
+    max_positions = 10**9 if lab_infinite else 2
+    if allow_new and len(positions) < max_positions and candidates:
         for best in candidates:
             # Check if we already have it
             if any(p.symbol == best.symbol for p in positions):
@@ -133,8 +144,8 @@ def run_options_demo_tick(
             if lot_cost <= 0: continue
             
             contracts = max(int(max_risk_ars / lot_cost), 1)
-            # Cap at 5 contracts for safety
-            contracts = min(contracts, 5)
+            if not lab_infinite:
+                contracts = min(contracts, 5)
             
             opt_q = chain.options.get(best.symbol)
             if not opt_q or opt_q.bid <= 0: continue

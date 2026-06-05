@@ -120,6 +120,8 @@ def run_stock_demo_tick(
     costs: CostModel = DEFAULT_COSTS,
     adaptive_context: Optional[AdaptiveContext] = None,
     block_junk: bool = True,
+    lab_infinite: bool = False,
+    capital: Optional[float] = None,
 ) -> StockDemoResult:
     """Advance the automatic paper loop once.
 
@@ -133,10 +135,20 @@ def run_stock_demo_tick(
     trade_file = Path(trades_path or settings.stock_demo_trades_file)
     max_age = float(quote_max_age_s if quote_max_age_s is not None else settings.stock_demo_quote_max_age_s)
     
-    # Capital base
-    base_capital = 1_800_000.0
-    scalp_limit = int(max_scalps if max_scalps is not None else settings.stock_demo_max_scalps)
-    swing_limit = int(max_swings if max_swings is not None else settings.stock_demo_max_swings)
+    base_capital = float(
+        capital
+        if capital is not None
+        else settings.lab_infinite_capital_ars
+        if lab_infinite
+        else 1_800_000.0
+    )
+    if lab_infinite:
+        scalp_limit = int(max_scalps) if max_scalps is not None else 10**9
+        swing_limit = int(max_swings) if max_swings is not None else 10**9
+        block_junk = False
+    else:
+        scalp_limit = int(max_scalps if max_scalps is not None else settings.stock_demo_max_scalps)
+        swing_limit = int(max_swings if max_swings is not None else settings.stock_demo_max_swings)
 
     positions = load_stock_demo_positions(pos_file)
     skipped: dict[str, int] = {}
@@ -211,7 +223,7 @@ def run_stock_demo_tick(
                 _count(skipped, "sin_edge_realizado")
                 continue
         # Score mínimo adaptativo: en modo DEFENSIVE solo entran setups de alta calidad
-        if adaptive_context is not None:
+        if adaptive_context is not None and not lab_infinite:
             min_score = getattr(adaptive_context, "min_score_for_entry", 65.0)
             if signal.score < min_score:
                 _count(skipped, f"score_bajo_{adaptive_context.mode.lower()}")
@@ -221,7 +233,7 @@ def run_stock_demo_tick(
             _count(skipped, "sin_quote")
             continue
         if not (quote.ask > 0 and quote.bid > 0 and quote.ask > quote.bid):
-            _count(skipped, "sin_book_valido")
+            _count(skipped, "sin_ask_para_entrar")
             continue
         mid = (quote.ask + quote.bid) / 2.0
         if mid > 0 and ((quote.ask - quote.bid) / mid * 100.0) > _MAX_SPREAD_PCT_DEMO:
@@ -236,7 +248,7 @@ def run_stock_demo_tick(
             _count(skipped, "riesgo_invalido")
             continue
             
-        kelly_pct = adaptive_context.half_kelly_pct if adaptive_context else 0.05
+        kelly_pct = 0.05 if lab_infinite else adaptive_context.half_kelly_pct if adaptive_context else 0.05
         max_risk_ars = base_capital * kelly_pct
         qty = int(max_risk_ars / risk_per_share)
         

@@ -1,8 +1,7 @@
 [Unit]
-Description=OptionsDesk — Chain recorder (Primary/IOL)
-After=network-online.target
+Description=OptionsDesk - Demo runner LAB_INFINITE
+After=network-online.target optionsdesk-recorder.service
 Wants=network-online.target
-# Dejar tiempo para que el WS se reconecte antes de reiniciar
 StartLimitBurst=5
 StartLimitIntervalSec=120
 
@@ -11,7 +10,7 @@ Type=simple
 User=optionsdesk
 WorkingDirectory=/opt/optionsdesk
 EnvironmentFile=/opt/optionsdesk/.env
-ExecStart=/opt/optionsdesk/.venv/bin/python -m optionsdesk.data.recorder
+ExecStart=/opt/optionsdesk/.venv/bin/python -m optionsdesk.backtest.demo_runner --interval 300 --lab-infinite
 Restart=always
 RestartSec=15
 StandardOutput=journal

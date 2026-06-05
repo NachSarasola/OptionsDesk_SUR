@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 _TREE_FILE = Path("data") / "strategy_tree.json"
 _MIN_REGIME_SAMPLE = 6     # trades minimos para confiar en un especialista
+_MIN_DEPLOY_FITNESS = 0.0
+_MIN_DEPLOY_TRADES = 12
 _MUTATE_PARAM_PROB = 0.5
 _MUTATE_FLAG_PROB = 0.25
 
@@ -261,12 +263,28 @@ def save_policy(outcome: SearchOutcome, path: Optional[Path] = None) -> None:
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "evaluated": pol.evaluated,
         "overall_fitness": pol.overall_fitness,
+        "overall_n": outcome.best_overall.result.overall.n,
+        "deployable": (
+            pol.overall_fitness > _MIN_DEPLOY_FITNESS
+            and outcome.best_overall.result.overall.n >= _MIN_DEPLOY_TRADES
+        ),
         "best_overall": _genome_to_dict(pol.best_overall),
         "regimes": regimes_out,
         "tree": [
             {
                 "id": nd.id, "parent": nd.parent_id, "depth": nd.depth,
                 "fitness": nd.result.overall.fitness, "n": nd.result.overall.n,
+                "regimes": {
+                    reg: {
+                        "n": rr.n,
+                        "fitness": rr.fitness,
+                        "win_rate": rr.win_rate,
+                        "profit_factor": rr.profit_factor,
+                        "drawdown_ars": rr.max_drawdown_ars,
+                    }
+                    for reg, rr in nd.result.by_regime.items()
+                    if rr.n > 0
+                },
             }
             for nd in outcome.nodes
         ][:200],
@@ -289,11 +307,36 @@ def load_policy_doc(path: Optional[Path] = None) -> Optional[dict]:
         return None
 
 
+def policy_deployability(
+    doc: dict,
+    *,
+    min_fitness: Optional[float] = None,
+    min_trades: Optional[int] = None,
+) -> tuple[bool, str]:
+    """Verifica si una politica puede pasar de research a runtime."""
+    try:
+        fitness = float(doc.get("overall_fitness", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        fitness = 0.0
+    try:
+        n = int(doc.get("overall_n", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    min_fit = _MIN_DEPLOY_FITNESS if min_fitness is None else float(min_fitness)
+    min_n = _MIN_DEPLOY_TRADES if min_trades is None else int(min_trades)
+    if fitness <= min_fit:
+        return False, f"fitness {fitness:.0f} <= {min_fit:.0f}"
+    if n < min_n:
+        return False, f"muestra {n} < {min_n}"
+    return True, "deployable"
+
+
 def deploy_for_regime(
     regime: str,
     *,
     data_dir: Optional[Path] = None,
     policy_path: Optional[Path] = None,
+    require_deployable: bool = True,
 ) -> Optional[str]:
     """Despliega al store el genoma de la politica para el regimen dado.
 
@@ -303,6 +346,19 @@ def deploy_for_regime(
     doc = load_policy_doc(policy_path)
     if not doc:
         return None
+    if require_deployable:
+        try:
+            from optionsdesk.config.settings import settings as _s
+            min_fitness = getattr(_s, "strategy_tree_min_deploy_fitness", _MIN_DEPLOY_FITNESS)
+            min_trades = getattr(_s, "strategy_tree_min_deploy_trades", _MIN_DEPLOY_TRADES)
+        except Exception:
+            min_fitness, min_trades = _MIN_DEPLOY_FITNESS, _MIN_DEPLOY_TRADES
+        ok, reason = policy_deployability(
+            doc, min_fitness=min_fitness, min_trades=min_trades,
+        )
+        if not ok:
+            logger.info("strategy_tree no desplegado: %s", reason)
+            return None
     regimes = doc.get("regimes", {})
     slot = regimes.get(regime) or {"genome": doc.get("best_overall")}
     genome = slot.get("genome") if slot else doc.get("best_overall")
@@ -322,7 +378,7 @@ def run_optimization(
     days: int = 240,
     max_evals: int = 40,
     seed: Optional[int] = None,
-    allow_synthetic: bool = True,
+    allow_synthetic: bool = False,
 ) -> SearchOutcome:
     """Carga el historico, corre la busqueda y persiste la politica. Devuelve el outcome.
 
@@ -361,11 +417,18 @@ def main() -> None:
     p.add_argument("--days", type=int, default=240, help="ruedas de historico")
     p.add_argument("--evals", type=int, default=40, help="genomas a evaluar")
     p.add_argument("--seed", type=int, default=None, help="semilla RNG (reproducible)")
+    p.add_argument("--allow-synthetic", action="store_true", help="solo smoke tests; no usar para research")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or None
-    outcome = run_optimization(syms, days=args.days, max_evals=args.evals, seed=args.seed)
+    outcome = run_optimization(
+        syms,
+        days=args.days,
+        max_evals=args.evals,
+        seed=args.seed,
+        allow_synthetic=args.allow_synthetic,
+    )
 
     print(f"\nEvaluados: {outcome.policy.evaluated} genomas")
     print(f"Mejor fitness global: {outcome.best_overall.result.overall.fitness:,.0f}\n")

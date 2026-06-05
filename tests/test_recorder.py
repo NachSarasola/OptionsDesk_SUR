@@ -34,12 +34,35 @@ def test_build_provider_prefers_primary(monkeypatch):
             self.connected = True
 
     fake = FakeProvider()
+    monkeypatch.setattr(recorder.settings, "market_data_provider", "AUTO")
     monkeypatch.setattr(recorder.settings, "primary_base_url", "https://example.test")
     monkeypatch.setattr(recorder.settings, "primary_user", "user")
     monkeypatch.setattr(recorder.settings, "primary_password", "password")
     monkeypatch.setattr(recorder.settings, "iol_user", "iol-user")
     monkeypatch.setattr(recorder.settings, "iol_password", "iol-password")
     monkeypatch.setattr(primary, "PrimaryProvider", lambda: fake)
+
+    assert recorder._build_provider() is fake
+    assert fake.connected
+
+
+def test_build_provider_can_force_iol(monkeypatch):
+    from optionsdesk.data.providers import iol
+
+    class FakeProvider:
+        connected = False
+
+        def connect(self):
+            self.connected = True
+
+    fake = FakeProvider()
+    monkeypatch.setattr(recorder.settings, "market_data_provider", "IOL")
+    monkeypatch.setattr(recorder.settings, "primary_base_url", "https://example.test")
+    monkeypatch.setattr(recorder.settings, "primary_user", "user")
+    monkeypatch.setattr(recorder.settings, "primary_password", "password")
+    monkeypatch.setattr(recorder.settings, "iol_user", "iol-user")
+    monkeypatch.setattr(recorder.settings, "iol_password", "iol-password")
+    monkeypatch.setattr(iol, "IOLProvider", lambda: fake)
 
     assert recorder._build_provider() is fake
     assert fake.connected
