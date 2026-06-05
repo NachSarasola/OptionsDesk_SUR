@@ -3158,6 +3158,33 @@ def _tab_positions(
         logger.debug("options demo tick fallo: %s", exc)
 
     bot_positions = _now_open_positions()
+    iol_rows = _positions_iol_rows()
+    
+    if iol_rows:
+        from optionsdesk.backtest.stock_demo import StockDemoPosition
+        from datetime import datetime
+        for p in iol_rows:
+            qty = p.get("cantidad", 0)
+            if qty <= 0: continue
+            sym = p.get("simbolo", "")
+            ppc = p.get("ppc", 0.0)
+            if not any(bp.symbol == sym for bp in bot_positions):
+                bot_positions.append(StockDemoPosition(
+                    id=f"IOL-{sym}",
+                    symbol=sym,
+                    strategy="REAL",
+                    signal_type="Sincronizado",
+                    entry_ts=datetime.now(),
+                    entry_price=ppc,
+                    quantity=int(qty),
+                    stop_price=ppc * 0.95,
+                    target_price=ppc * 1.10,
+                    entry_fee_ars=0.0,
+                    time_stop_min=0,
+                    max_holding_days=30,
+                    rationale="Posición importada de IOL",
+                    score=0.0
+                ))
 
     sub_adv, sub_iol, sub_demo = st.tabs([
         f"Analizador ({len(bot_positions)})", "Cartera IOL", "Demo",
@@ -3170,29 +3197,51 @@ def _tab_positions(
         )
 
     with sub_iol:
-        iol_rows = _positions_iol_rows()
         if iol_rows:
-            st.caption("Cuenta IOL — datos del broker (sin gestion CRR automatica)")
-            view = [
-                {
-                    "Simbolo": p.get("simbolo", ""),
-                    "Cantidad": p.get("cantidad", 0),
-                    "PPC": p.get("ppc", 0.0),
-                    "Ultimo": p.get("ultimo", 0.0),
-                    "Gan. %": p.get("ganancia_pct", 0.0),
-                }
-                for p in iol_rows
-            ]
+            st.caption("Cuenta IOL — Sincronizada con el broker")
+            
+            total_invertido = 0.0
+            total_valorizado = 0.0
+            
+            view = []
+            for p in iol_rows:
+                qty = p.get("cantidad", 0)
+                ppc = p.get("ppc", 0.0)
+                ult = p.get("ultimo", 0.0)
+                val = p.get("valorizado", 0.0)
+                if val == 0 and qty > 0:
+                    val = qty * ult
+                    
+                invertido = qty * ppc
+                pnl_pesos = val - invertido
+                
+                total_invertido += invertido
+                total_valorizado += val
+                
+                view.append({
+                    "Símbolo": p.get("simbolo", ""),
+                    "Cantidad": int(qty),
+                    "PPC ($)": f"{ppc:,.2f}",
+                    "Último ($)": f"{ult:,.2f}",
+                    "Invertido ($)": f"{invertido:,.2f}",
+                    "Valorizado ($)": f"{val:,.2f}",
+                    "PnL ($)": f"{pnl_pesos:+,.2f}",
+                    "Ganancia %": f"{p.get('ganancia_pct', 0.0):+.2f}%",
+                })
+            
+            total_pnl = total_valorizado - total_invertido
+            total_pnl_pct = (total_pnl / total_invertido * 100.0) if total_invertido > 0 else 0.0
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Capital Invertido", f"${total_invertido:,.0f}")
+            c2.metric("Total Valorizado", f"${total_valorizado:,.0f}", f"{total_pnl_pct:+.2f}%")
+            c3.metric("PnL Abierto", f"${total_pnl:+,.0f}")
+            c4.metric("Posiciones Activas", len(view))
+            
             st.dataframe(pd.DataFrame(view), hide_index=True, use_container_width=True)
-            st.caption(
-                "Para analisis completo: registra estas posiciones en "
-                "data/open_positions.jsonl y aparecen en el Analizador."
-            )
+            st.caption("Las posiciones de IOL se inyectan automáticamente en el Analizador.")
         else:
-            st.caption(
-                "Sin opciones GGAL en IOL." if settings.is_iol_configured()
-                else "IOL no configurado (.env)."
-            )
+            st.caption("Sin posiciones en IOL o broker no configurado.")
 
     with sub_demo:
         try:
@@ -3585,6 +3634,73 @@ def main() -> None:
             benchmark=benchmark,
             adaptive_context=adaptive_context,
         )
+
+    with t_genetic:
+        import streamlit as st
+        st.subheader("🧬 Laboratorio Genético")
+        st.caption("Bots autónomos operando en Forward-Testing continuo con mutaciones.")
+        if "genetic_engine" in st.session_state:
+            engine = st.session_state.genetic_engine
+            
+            view_mode = st.radio("Vista", ["🏆 Clasificación Activa", "🌳 Árbol Genealógico"], horizontal=True)
+            
+            if view_mode == "🏆 Clasificación Activa":
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    bots = sorted(engine.bots, key=lambda b: b.pnl_pct(), reverse=True)
+                    view = []
+                    for b in bots:
+                        view.append({
+                            "Bot ID": b.id,
+                            "Gen": b.generation,
+                            "PnL %": f"{b.pnl_pct():.2f}%",
+                            "Capital": f"${b.capital:,.0f}",
+                            "Abiertas": len(b.open_positions),
+                            "Cerradas": len(b.closed_trades),
+                            "Stop (ATR)": b.genome.atr_stop_mult,
+                            "Min RR": b.genome.min_rr,
+                            "Req Bull": "Sí" if b.genome.require_merval_bull else "No",
+                            "Req CCL": "Sí" if b.genome.require_ccl_stable else "No"
+                        })
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(view), hide_index=True, use_container_width=True)
+                    
+                with c2:
+                    st.markdown("### Panel de Control")
+                    st.metric("Población Activa", len(engine.bots))
+                    
+                    if st.button("✂️ Forzar Poda y Evolución"):
+                        engine.prune_and_breed()
+                        st.success("¡Nueva generación engendrada!")
+                        st.rerun()
+
+            else:
+                st.markdown("### Ramificaciones y Descartes")
+                st.caption("Verde = Sobrevivientes | Rojo = Descartados por mal rendimiento")
+                
+                # Build Graphviz DOT string
+                graph = "digraph Lineage {\\n"
+                graph += '  rankdir=TB;\\n'
+                graph += '  node [shape=box, style=filled, fontname="sans-serif", fontsize=10];\\n'
+                graph += '  edge [color="#666666", arrowhead=open];\\n'
+                
+                for b in engine.historical_bots:
+                    color = '"#A8E6CF"' if b.status == "alive" else '"#FF8B94"'
+                    label = f"Gen {b.generation}\\\\nBot: {b.id}\\\\nATR: {b.genome.atr_stop_mult}x | RR: {b.genome.min_rr}"
+                    if b.status == "dead":
+                        label += f"\\\\n(Muerto en G{b.death_generation})"
+                    else:
+                        label += f"\\\\nPnL: {b.pnl_pct():.1f}%"
+                        
+                    graph += f'  "{b.id}" [label="{label}", fillcolor={color}];\\n'
+                    if getattr(b, "parent_id", None):
+                        graph += f'  "{b.parent_id}" -> "{b.id}";\\n'
+                        
+                graph += "}\\n"
+                st.graphviz_chart(graph)
+                
+        else:
+            st.info("El motor genético aún no ha arrancado. Espera el próximo tick del scanner.")
 
     if advanced_mode:
         with t_ops:
